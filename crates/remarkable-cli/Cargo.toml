@@ -4,20 +4,36 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "CLI for reMarkable document tools"
+description = "Complete CLI for reMarkable tablet management and sync"
 
 [[bin]]
 name = "remarkable"
 path = "src/main.rs"
 
 [dependencies]
-walkdir = "2"
+# Workspace crates
 remarkable-core.workspace = true
 remarkable-lines.workspace = true
 remarkable-sync.workspace = true
 remarkable-pdf.workspace = true
+remarkable-mqtt.workspace = true
+remarkable-usb.workspace = true
+remarkable-screen.workspace = true
+
+# External dependencies
+walkdir = "2"
 reqwest.workspace = true
-clap.workspace = true
+clap = { version = "4.5", features = ["derive", "env"] }
 tokio.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+indicatif = { version = "0.17", features = ["tokio"] }
+tabled = "0.18"
+colored = "2"
+thiserror = "1"

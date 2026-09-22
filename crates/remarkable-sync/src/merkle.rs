@@ -10,15 +10,17 @@ pub fn hash_document(doc: &Document) -> String {
     // Hash document ID
     hasher.update(doc.id.as_bytes());
     
-    // Hash metadata
-    if let Ok(meta_json) = serde_json::to_string(&doc.metadata) {
-        hasher.update(meta_json.as_bytes());
-    }
+    // Hash document name
+    hasher.update(doc.name.as_bytes());
     
-    // Hash content
-    if let Ok(content_json) = serde_json::to_string(&doc.content) {
-        hasher.update(content_json.as_bytes());
-    }
+    // Hash parent
+    hasher.update(doc.parent.as_bytes());
+    
+    // Hash modified timestamp
+    hasher.update(doc.modified.as_bytes());
+    
+    // Hash page count
+    hasher.update(&(doc.pages.len() as u64).to_le_bytes());
     
     hex::encode(hasher.finalize())
 }

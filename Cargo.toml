@@ -16,6 +16,7 @@ members = [
     "crates/remarkable-firmware",
     "crates/remarkable-screen",
     "crates/remarkable-dbus",
+    "crates/remarkable-screenshare",
 ]
 
 [workspace.package]
@@ -25,13 +26,16 @@ authors = ["reMarkable Research"]
 license = "MIT"
 
 [workspace.dependencies]
-# Internal crates (only those used by other crates)
+# Internal crates
 remarkable-core = { path = "crates/remarkable-core" }
 remarkable-lines = { path = "crates/remarkable-lines" }
 remarkable-sync = { path = "crates/remarkable-sync" }
 remarkable-pdf = { path = "crates/remarkable-pdf" }
+remarkable-mqtt = { path = "crates/remarkable-mqtt" }
+remarkable-usb = { path = "crates/remarkable-usb" }
+remarkable-screen = { path = "crates/remarkable-screen" }
 
-# External dependencies (only those actually used)
+# External dependencies
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -44,4 +48,74 @@ byteorder = "1.5"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
+hex = "0.4"
 uuid = { version = "1.10", features = ["v4", "serde"] }
+walkdir = "2"
+directories = "5"
+indicatif = { version = "0.17", features = ["tokio"] }
+tabled = "0.18"
+colored = "2"
+rumqttc = { version = "0.24", features = ["websocket"] }
+
+# Test dependencies
+axum = "0.8"
+tempfile = "3"
+crc32c = "0.6"
+
+# Integration test package
+[package]
+name = "remarkable-integration-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+remarkable-core.workspace = true
+remarkable-lines.workspace = true
+remarkable-sync.workspace = true
+remarkable-mqtt.workspace = true
+remarkable-usb.workspace = true
+remarkable-screen.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+base64.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+
+# Test-only deps
+axum.workspace = true
+tempfile.workspace = true
+crc32c.workspace = true
+
+[[test]]
+name = "integration_pairing"
+path = "tests/integration_pairing.rs"
+
+[[test]]
+name = "integration_download"
+path = "tests/integration_download.rs"
+
+[[test]]
+name = "integration_upload"
+path = "tests/integration_upload.rs"
+
+[[test]]
+name = "integration_sync"
+path = "tests/integration_sync.rs"
+
+[[test]]
+name = "integration_screen"
+path = "tests/integration_screen.rs"
+
+[[test]]
+name = "integration_mqtt"
+path = "tests/integration_mqtt.rs"
+
+[[test]]
+name = "integration_backup"
+path = "tests/integration_backup.rs"

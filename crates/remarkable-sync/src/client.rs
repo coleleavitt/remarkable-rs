@@ -6,6 +6,7 @@
 //! - Merkle tree hash structure for efficient delta sync
 //! - rm-filename header for file identification  
 //! - SHA-256 content hashes for deduplication
+//! - CRC32C checksums for upload verification (Google Cloud Storage)
 //!
 //! ## Hash Tree Structure
 //! 
@@ -19,9 +20,10 @@
 
 use reqwest::{Client, header};
 use crate::SyncError;
+use crate::checksum::x_goog_hash_header;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Tectonic regions for geo-routing
 pub const TECTONIC_REGIONS: &[&str] = &[
@@ -36,6 +38,9 @@ pub const SYNC_API_BASE: &str = "https://{region}.tectonic.remarkable.com";
 
 /// Auth API base
 pub const AUTH_API_BASE: &str = "https://webapp.cloud.remarkable.engineering";
+
+/// Discovery URL
+pub const DISCOVERY_URL: &str = "https://internal.cloud.remarkable.com";
 
 /// Device token (long-lived)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +63,8 @@ pub struct SyncRoot {
     pub hash: String,
     #[serde(rename = "generation")]
     pub generation: u64,
+    #[serde(rename = "schemaVersion", default)]
+    pub schema_version: u32,
 }
 
 /// Document entry from root index
@@ -116,6 +123,19 @@ impl DocumentSchema {
         
         Ok(Self { files })
     }
+    
+    /// Serialize schema back to text format
+    pub fn serialize(&self) -> String {
+        let mut output = format!("{}\n", self.files.len());
+        for file in &self.files {
+            // Format: hash:flags:filename:offset:size
+            output.push_str(&format!(
+                "{}:0:{}:0:{}\n",
+                file.hash, file.filename, file.size
+            ));
+        }
+        output
+    }
 }
 
 /// Document metadata
@@ -135,6 +155,21 @@ pub struct DocMetadata {
     pub doc_type: Option<String>,
     #[serde(rename = "visibleName")]
     pub visible_name: Option<String>,
+    /// Delete flag (soft delete)
+    #[serde(default)]
+    pub deleted: Option<bool>,
+}
+
+impl DocMetadata {
+    /// Check if this is a folder
+    pub fn is_folder(&self) -> bool {
+        self.doc_type.as_ref().map_or(false, |t| t == "CollectionType")
+    }
+    
+    /// Check if this is a document
+    pub fn is_document(&self) -> bool {
+        self.doc_type.as_ref().map_or(false, |t| t == "DocumentType")
+    }
 }
 
 /// Content file structure (pages and transforms)
@@ -171,6 +206,47 @@ pub struct DownloadedDocument {
     pub content: Option<ContentFile>,
     pub pages: HashMap<String, Vec<u8>>,  // page_id -> .rm file content
     pub pdf: Option<Vec<u8>>,
+}
+
+/// Upload context for batch operations
+#[derive(Debug, Clone)]
+pub struct UploadContext {
+    /// Unique sync session ID
+    pub sync_id: String,
+    /// Current batch number (increments for each file in batch)
+    pub batch_number: u32,
+    /// Parent hash (root hash for top-level ops)
+    pub parent_hash: String,
+    /// Expected generation for optimistic locking
+    pub expect_generation: Option<u64>,
+}
+
+impl UploadContext {
+    /// Create a new upload context for a sync session
+    pub fn new(parent_hash: String) -> Self {
+        Self {
+            sync_id: Uuid::new_v4().to_string(),
+            batch_number: 0,
+            parent_hash,
+            expect_generation: None,
+        }
+    }
+    
+    /// Increment batch number and return current
+    pub fn next_batch(&mut self) -> u32 {
+        let current = self.batch_number;
+        self.batch_number += 1;
+        current
+    }
+}
+
+/// Upload result with hash information
+#[derive(Debug, Clone)]
+pub struct UploadResult {
+    /// SHA-256 hash of uploaded content
+    pub hash: String,
+    /// Size in bytes
+    pub size: u64,
 }
 
 /// Sync client
@@ -267,6 +343,50 @@ impl SyncClient {
         }
     }
     
+    /// Update sync root (push new hash)
+    /// 
+    /// Uses optimistic locking with expected generation.
+    pub async fn update_root(&self, hash: &str, generation: u64) -> Result<(), SyncError> {
+        let url = format!("{}/sync/v3/root", self.base_url());
+        
+        #[derive(Serialize)]
+        struct RootUpdate {
+            hash: String,
+            generation: u64,
+        }
+        
+        let body = RootUpdate {
+            hash: hash.to_string(),
+            generation,
+        };
+        
+        let resp = self.client
+            .put(&url)
+            .header(header::AUTHORIZATION, self.auth_header()?)
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        
+        match resp.status().as_u16() {
+            200 | 201 | 204 => Ok(()),
+            401 => Err(SyncError::TokenExpired),
+            409 => {
+                // Generation mismatch - concurrent update
+                let current = self.get_root().await?;
+                Err(SyncError::Conflict {
+                    local_gen: generation,
+                    remote_gen: current.generation,
+                })
+            }
+            429 => Err(SyncError::RateLimited),
+            status => Err(SyncError::Server {
+                status,
+                message: resp.text().await.unwrap_or_default(),
+            }),
+        }
+    }
+    
     /// Download a file by hash
     /// 
     /// IMPORTANT: The rm-filename header is required by the API.
@@ -280,12 +400,15 @@ impl SyncClient {
             return Err(SyncError::MissingFilename);
         }
         
+        // Extract just the filename if a path was passed
+        let filename = rm_filename.split('/').last().unwrap_or(rm_filename);
+        
         let url = format!("{}/sync/v3/files/{}", self.base_url(), hash);
         
         let resp = self.client
             .get(&url)
             .header(header::AUTHORIZATION, self.auth_header()?)
-            .header("rm-filename", rm_filename)
+            .header("rm-filename", filename)
             .send()
             .await?;
         
@@ -293,6 +416,90 @@ impl SyncClient {
             200 => Ok(resp.bytes().await?.to_vec()),
             401 => Err(SyncError::TokenExpired),
             404 => Err(SyncError::NotFound(hash.to_string())),
+            429 => Err(SyncError::RateLimited),
+            status => Err(SyncError::Server {
+                status,
+                message: resp.text().await.unwrap_or_default(),
+            }),
+        }
+    }
+    
+    /// Upload a file with proper checksum headers
+    /// 
+    /// Returns the hash of the uploaded file.
+    /// 
+    /// # Headers sent
+    /// - `Authorization`: Bearer token
+    /// - `rm-filename`: File identifier  
+    /// - `x-goog-hash`: CRC32C checksum for GCS verification
+    /// - `rm-parent-hash`: Parent hash for tree linkage (if context provided)
+    /// - `rm-sync-id`: Sync session ID (if context provided)
+    /// - `rm-batch-number`: Batch operation number (if context provided)
+    pub async fn upload_file(
+        &self,
+        data: &[u8],
+        rm_filename: &str,
+    ) -> Result<UploadResult, SyncError> {
+        self.upload_file_with_context(data, rm_filename, None).await
+    }
+    
+    /// Upload a file with upload context for batch operations
+    pub async fn upload_file_with_context(
+        &self,
+        data: &[u8],
+        rm_filename: &str,
+        ctx: Option<&mut UploadContext>,
+    ) -> Result<UploadResult, SyncError> {
+        if rm_filename.is_empty() {
+            return Err(SyncError::MissingFilename);
+        }
+        
+        // Calculate SHA-256 hash for content addressing
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash = hex::encode(hasher.finalize());
+        
+        // Calculate CRC32C for GCS verification
+        let crc_header = x_goog_hash_header(data);
+        
+        // Extract just filename (no path)
+        let filename = rm_filename.split('/').last().unwrap_or(rm_filename);
+        
+        let url = format!("{}/sync/v3/files/{}", self.base_url(), hash);
+        
+        let mut req = self.client
+            .put(&url)
+            .header(header::AUTHORIZATION, self.auth_header()?)
+            .header("rm-filename", filename)
+            .header("x-goog-hash", crc_header)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, data.len());
+        
+        // Add context headers if provided
+        if let Some(context) = ctx {
+            req = req
+                .header("rm-parent-hash", &context.parent_hash)
+                .header("rm-sync-id", &context.sync_id)
+                .header("rm-batch-number", context.next_batch().to_string());
+            
+            if let Some(gen) = context.expect_generation {
+                req = req.header("rm-expect-version", gen.to_string());
+            }
+        }
+        
+        let resp = req.body(data.to_vec()).send().await?;
+        
+        match resp.status().as_u16() {
+            200 | 201 => Ok(UploadResult {
+                hash,
+                size: data.len() as u64,
+            }),
+            401 => Err(SyncError::TokenExpired),
+            409 => Err(SyncError::Conflict {
+                local_gen: 0,
+                remote_gen: 0,
+            }),
             429 => Err(SyncError::RateLimited),
             status => Err(SyncError::Server {
                 status,
@@ -318,8 +525,8 @@ impl SyncClient {
     
     /// Get document schema (hash tree for a single document)
     pub async fn get_document_schema(&self, doc_hash: &str, doc_id: &str) -> Result<DocumentSchema, SyncError> {
-        // The document hash points to a schema.txt file
-        let schema_filename = format!("{}/schema.txt", doc_id);
+        // Schema file is named with doc_id prefix  
+        let schema_filename = format!("{}.docSchema", doc_id);
         let schema_data = self.download_file(doc_hash, &schema_filename).await?;
         let schema_str = String::from_utf8_lossy(&schema_data);
         
@@ -428,42 +635,6 @@ impl SyncClient {
         
         Ok(downloaded)
     }
-    
-    /// Upload a file
-    /// 
-    /// Returns the hash of the uploaded file
-    pub async fn upload_file(&self, data: &[u8], rm_filename: &str) -> Result<String, SyncError> {
-        if rm_filename.is_empty() {
-            return Err(SyncError::MissingFilename);
-        }
-        
-        // Calculate SHA-256 hash
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let hash = format!("{:x}", hasher.finalize());
-        
-        let url = format!("{}/sync/v3/files/{}", self.base_url(), hash);
-        
-        let resp = self.client
-            .put(&url)
-            .header(header::AUTHORIZATION, self.auth_header()?)
-            .header("rm-filename", rm_filename)
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .body(data.to_vec())
-            .send()
-            .await?;
-        
-        match resp.status().as_u16() {
-            200 | 201 => Ok(hash),
-            401 => Err(SyncError::TokenExpired),
-            429 => Err(SyncError::RateLimited),
-            status => Err(SyncError::Server {
-                status,
-                message: resp.text().await.unwrap_or_default(),
-            }),
-        }
-    }
 }
 
 impl Default for SyncClient {
@@ -566,7 +737,14 @@ pub mod auth {
         let payload = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
         let json: serde_json::Value = serde_json::from_slice(&payload).ok()?;
         
-        json.get(claim)?.as_str().map(|s| s.to_string())
+        // Check for nested claim (e.g., https://auth.remarkable.com/tectonic)
+        if let Some(val) = json.get(claim).and_then(|v| v.as_str()) {
+            return Some(val.to_string());
+        }
+        
+        // Check for remarkable-specific claim format
+        let rm_claim = format!("https://auth.remarkable.com/{}", claim);
+        json.get(&rm_claim)?.as_str().map(|s| s.to_string())
     }
     
     /// Parse scopes from JWT
@@ -587,9 +765,7 @@ pub mod auth {
     }
 }
 
-
-
-    #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
     
@@ -618,105 +794,12 @@ mod tests {
         let result = DocumentSchema::parse("");
         assert!(result.is_err());
     }
-}
-
-
-use remarkable_core::{DocumentMetadata, DocumentContent};
-
-impl SyncClient {
-    /// Parse document metadata from .metadata file contents
-    pub fn parse_metadata(content: &str) -> Result<DocumentMetadata, SyncError> {
-        serde_json::from_str(content)
-            .map_err(|e| SyncError::Parse(format!("Failed to parse metadata: {}", e)))
-    }
-    
-    /// Parse document content from .content file contents
-    pub fn parse_content(content: &str) -> Result<DocumentContent, SyncError> {
-        serde_json::from_str(content)
-            .map_err(|e| SyncError::Parse(format!("Failed to parse content: {}", e)))
-    }
-    
-    /// Get full document info including metadata and content
-    pub async fn get_document_info(&self, doc_id: &str) -> Result<(DocumentMetadata, DocumentContent), SyncError> {
-        // Get the document hash from root
-        let docs = self.list_documents().await?;
-        let doc = docs.iter()
-            .find(|d| d.uuid == doc_id)
-            .ok_or_else(|| SyncError::Parse(format!("Document {} not found", doc_id)))?;
-        
-        // Download metadata and content files
-        let metadata_content = self.download_file(&doc.hash, &format!("{}.metadata", doc_id)).await?;
-        let content_content = self.download_file(&doc.hash, &format!("{}.content", doc_id)).await?;
-        
-        let metadata = Self::parse_metadata(&String::from_utf8_lossy(&metadata_content))?;
-        let content = Self::parse_content(&String::from_utf8_lossy(&content_content))?;
-        
-        Ok((metadata, content))
-    }
-}
-
-#[cfg(test)]
-mod metadata_tests {
-    use super::*;
-    use remarkable_core::{DocumentMetadata, DocumentContent};
     
     #[test]
-    fn test_parse_metadata() {
-        let json = r#"{
-            "createdTime": "1715695544486",
-            "lastModified": "1718759769109",
-            "lastOpened": "1729709212944",
-            "lastOpenedPage": 4,
-            "parent": "",
-            "pinned": false,
-            "type": "DocumentType",
-            "visibleName": "brainstorm"
-        }"#;
-        
-        let metadata: DocumentMetadata = serde_json::from_str(json).unwrap();
-        assert_eq!(metadata.visible_name, "brainstorm");
-        assert!(metadata.is_document());
-        assert!(!metadata.is_folder());
-    }
-    
-    #[test]
-    fn test_parse_folder_metadata() {
-        let json = r#"{
-            "createdTime": "1706121472417",
-            "lastModified": "1706121472406",
-            "parent": "",
-            "pinned": false,
-            "type": "CollectionType",
-            "visibleName": "Folder 3"
-        }"#;
-        
-        let metadata: DocumentMetadata = serde_json::from_str(json).unwrap();
-        assert_eq!(metadata.visible_name, "Folder 3");
-        assert!(metadata.is_folder());
-        assert!(!metadata.is_document());
-    }
-    
-    #[test]
-    fn test_parse_content() {
-        let json = r#"{
-            "cPages": {
-                "pages": [
-                    {"id": "page1", "idx": {"timestamp": "2:2", "value": "ba"}},
-                    {"id": "page2", "idx": {"timestamp": "2:2", "value": "bb"}}
-                ],
-                "uuids": []
-            },
-            "pageCount": 2,
-            "fileType": "notebook",
-            "tags": []
-        }"#;
-        
-        let content: DocumentContent = serde_json::from_str(json).unwrap();
-        assert_eq!(content.page_count, Some(2));
-        let pages = content.page_ids();
-        assert_eq!(pages.len(), 2);
-        assert_eq!(pages[0], "page1");
-        assert_eq!(pages[1], "page2");
+    fn test_upload_context_batch() {
+        let mut ctx = UploadContext::new("abc123".to_string());
+        assert_eq!(ctx.next_batch(), 0);
+        assert_eq!(ctx.next_batch(), 1);
+        assert_eq!(ctx.next_batch(), 2);
     }
 }
-

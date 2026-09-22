@@ -120,16 +120,6 @@ impl SyncComplete {
     }
 }
 
-/// Screen share signaling message (structure TBD)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScreenShareSignal {
-    /// Signal type (offer, answer, ice-candidate, etc.)
-    #[serde(rename = "type")]
-    pub signal_type: String,
-
-    /// Signal payload
-    pub payload: serde_json::Value,
-}
 
 /// Parse MQTT payload into appropriate event type
 pub fn parse_mqtt_payload(topic: &str, payload: &[u8]) -> MqttEvent {

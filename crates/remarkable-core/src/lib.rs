@@ -4,10 +4,12 @@
 //! the remarkable-* crate ecosystem.
 
 mod types;
+
 pub mod crdt;
 pub mod template;
 pub mod pdf_annotation;
 
+// Export all types from the unified types module
 pub use types::*;
 pub use template::*;
 pub use pdf_annotation::*;

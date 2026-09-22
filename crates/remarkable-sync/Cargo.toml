@@ -15,6 +15,11 @@ thiserror.workspace = true
 tokio.workspace = true
 sha2.workspace = true
 base64.workspace = true
+hex.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-remarkable-lines.workspace = true
+remarkable-lines = { workspace = true, optional = true }
+
+[features]
+default = []
+lines = ["remarkable-lines"]

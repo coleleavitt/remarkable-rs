@@ -1,0 +1,60 @@
+[package]
+name = "remarkable-screenshare"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "reMarkable screen share viewer - MQTT signaling + WebRTC DataChannel + RFB"
+keywords = ["remarkable", "screenshare", "webrtc", "rfb", "vnc"]
+
+[[bin]]
+name = "screenshare"
+path = "src/bin/screenshare.rs"
+
+[[bin]]
+name = "usb-capture"
+path = "src/bin/usb_capture.rs"
+
+[dependencies]
+# Internal crates
+
+# WebRTC
+webrtc = "0.12"
+
+# MQTT
+rumqttc = "0.24"
+
+# Display
+minifb = "0.27"
+
+# Image processing
+image = { version = "0.25", features = ["png", "gif"] }
+
+# Async runtime
+tokio = { version = "1.0", features = ["full", "sync", "rt-multi-thread"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Encoding
+base64 = "0.22"
+byteorder = "1.5"
+flate2 = "1.0"
+
+# Bytes
+bytes = "1.10"
+
+# Utilities
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+uuid = { version = "1.10", features = ["v4"] }
+chrono = "0.4"
+
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"

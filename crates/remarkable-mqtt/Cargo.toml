@@ -7,7 +7,7 @@ license.workspace = true
 description = "MQTT client for reMarkable real-time sync notifications"
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "sync", "time"] }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -15,7 +15,8 @@ base64.workspace = true
 uuid.workspace = true
 tracing.workspace = true
 rumqttc = { version = "0.24", features = ["use-native-tls"] }
-# For the test binary
+
+# For binaries
 tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -24,9 +25,14 @@ tracing-subscriber.workspace = true
 
 [features]
 default = []
-test-bin = ["tracing-subscriber"]
+cli = ["tracing-subscriber"]
 
 [[bin]]
 name = "mqtt-test"
 path = "src/bin/mqtt_test.rs"
-required-features = ["test-bin"]
+required-features = ["cli"]
+
+[[bin]]
+name = "remarkable-mqtt"
+path = "src/bin/remarkable_mqtt.rs"
+required-features = ["cli"]
