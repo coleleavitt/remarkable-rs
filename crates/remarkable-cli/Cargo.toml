@@ -37,3 +37,4 @@ indicatif = { version = "0.17", features = ["tokio"] }
 tabled = "0.18"
 colored = "2"
 thiserror = "1"
+uuid.workspace = true

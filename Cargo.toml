@@ -61,6 +61,7 @@ rumqttc = { version = "0.24", features = ["websocket"] }
 axum = "0.8"
 tempfile = "3"
 crc32c = "0.6"
+futures = "0.3"
 
 # Integration test package
 [package]
@@ -91,6 +92,7 @@ thiserror.workspace = true
 axum.workspace = true
 tempfile.workspace = true
 crc32c.workspace = true
+futures = "0.3"
 
 [[test]]
 name = "integration_pairing"
@@ -119,3 +121,11 @@ path = "tests/integration_mqtt.rs"
 [[test]]
 name = "integration_backup"
 path = "tests/integration_backup.rs"
+
+[[test]]
+name = "test_local_pairing"
+path = "tests/test_local_pairing.rs"
+
+[[test]]
+name = "test_device_simulation"
+path = "tests/test_device_simulation.rs"

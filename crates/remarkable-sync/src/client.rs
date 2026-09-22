@@ -249,23 +249,78 @@ pub struct UploadResult {
     pub size: u64,
 }
 
+/// Server mode for sync client
+#[derive(Debug, Clone, Default)]
+pub enum ServerMode {
+    /// reMarkable cloud (default)
+    #[default]
+    Cloud,
+    /// Local server with custom URL
+    Local {
+        url: String,
+        skip_tls_verify: bool,
+    },
+}
+
 /// Sync client
 pub struct SyncClient {
     client: Client,
     device_token: Option<DeviceToken>,
     user_token: Option<UserToken>,
     region: String,
+    server_mode: ServerMode,
 }
 
 impl SyncClient {
-    /// Create a new sync client
+    /// Create a new sync client for cloud
     pub fn new() -> Self {
         Self {
             client: Client::new(),
             device_token: None,
             user_token: None,
             region: "eu".to_string(),
+            server_mode: ServerMode::default(),
         }
+    }
+    
+    /// Create a sync client for a local server
+    pub fn local(server_url: impl Into<String>) -> Result<Self, SyncError> {
+        Self::local_with_options(server_url, false)
+    }
+    
+    /// Create a sync client for a local server with TLS options
+    pub fn local_with_options(server_url: impl Into<String>, skip_tls_verify: bool) -> Result<Self, SyncError> {
+        let url = server_url.into();
+        
+        let client = if skip_tls_verify {
+            Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()?
+        } else {
+            Client::new()
+        };
+        
+        Ok(Self {
+            client,
+            device_token: None,
+            user_token: None,
+            region: "local".to_string(),
+            server_mode: ServerMode::Local {
+                url,
+                skip_tls_verify,
+            },
+        })
+    }
+    
+    /// Set server mode
+    pub fn with_server_mode(mut self, mode: ServerMode) -> Self {
+        self.server_mode = mode;
+        self
+    }
+    
+    /// Check if using local server
+    pub fn is_local(&self) -> bool {
+        matches!(self.server_mode, ServerMode::Local { .. })
     }
     
     /// Set device token
@@ -306,9 +361,35 @@ impl SyncClient {
             }))
     }
     
-    /// Get the base URL for the current region
+    /// Load tokens from files for a local server
+    pub fn from_token_files_local(
+        device_token_path: &str,
+        user_token_path: &str,
+        server_url: &str,
+        skip_tls_verify: bool,
+    ) -> Result<Self, SyncError> {
+        let device_token = std::fs::read_to_string(device_token_path)?;
+        let user_token = std::fs::read_to_string(user_token_path)?;
+        
+        let scopes = auth::parse_jwt_scopes(&user_token);
+        
+        let mut client = Self::local_with_options(server_url, skip_tls_verify)?;
+        client.device_token = Some(DeviceToken { token: device_token.trim().to_string() });
+        client.user_token = Some(UserToken {
+            token: user_token.trim().to_string(),
+            region: "local".to_string(),
+            scopes,
+        });
+        
+        Ok(client)
+    }
+    
+    /// Get the base URL for the current region or local server
     fn base_url(&self) -> String {
-        SYNC_API_BASE.replace("{region}", &self.region)
+        match &self.server_mode {
+            ServerMode::Cloud => SYNC_API_BASE.replace("{region}", &self.region),
+            ServerMode::Local { url, .. } => url.trim_end_matches('/').to_string(),
+        }
     }
     
     /// Get authorization header
@@ -643,6 +724,24 @@ impl Default for SyncClient {
     }
 }
 
+impl ServerMode {
+    /// Create local server mode
+    pub fn local(url: impl Into<String>) -> Self {
+        Self::Local {
+            url: url.into(),
+            skip_tls_verify: false,
+        }
+    }
+    
+    /// Create local server mode with TLS skip
+    pub fn local_insecure(url: impl Into<String>) -> Self {
+        Self::Local {
+            url: url.into(),
+            skip_tls_verify: true,
+        }
+    }
+}
+
 /// Token management
 pub mod auth {
     use super::*;
@@ -663,13 +762,23 @@ pub mod auth {
         pub token: String,
     }
     
-    /// Exchange a one-time code for device token
+    /// Exchange a one-time code for device token (cloud)
     pub async fn pair_device(
         client: &Client,
         code: &str,
         device_id: &str,
     ) -> Result<DeviceToken, SyncError> {
-        let url = "https://webapp.cloud.remarkable.engineering/token/json/2/device/new";
+        pair_device_with_server(client, code, device_id, AUTH_API_BASE).await
+    }
+    
+    /// Exchange a one-time code for device token (configurable server)
+    pub async fn pair_device_with_server(
+        client: &Client,
+        code: &str,
+        device_id: &str,
+        server_url: &str,
+    ) -> Result<DeviceToken, SyncError> {
+        let url = format!("{}/token/json/2/device/new", server_url.trim_end_matches('/'));
         
         let req = PairRequest {
             code: code.to_string(),
@@ -678,15 +787,21 @@ pub mod auth {
         };
         
         let resp = client
-            .post(url)
+            .post(&url)
             .json(&req)
             .send()
             .await?;
         
         match resp.status().as_u16() {
             200 => {
-                let token_resp: TokenResponse = resp.json().await?;
-                Ok(DeviceToken { token: token_resp.token })
+                // Try to parse as JSON first
+                let text = resp.text().await?;
+                if let Ok(token_resp) = serde_json::from_str::<TokenResponse>(&text) {
+                    Ok(DeviceToken { token: token_resp.token })
+                } else {
+                    // Plain text token
+                    Ok(DeviceToken { token: text.trim().to_string() })
+                }
             }
             status => Err(SyncError::Server {
                 status,
@@ -695,15 +810,24 @@ pub mod auth {
         }
     }
     
-    /// Refresh user token using device token
+    /// Refresh user token using device token (cloud)
     pub async fn refresh_user_token(
         client: &Client,
         device_token: &DeviceToken,
     ) -> Result<UserToken, SyncError> {
-        let url = "https://webapp.cloud.remarkable.engineering/token/json/2/user/new";
+        refresh_user_token_with_server(client, device_token, AUTH_API_BASE).await
+    }
+    
+    /// Refresh user token using device token (configurable server)
+    pub async fn refresh_user_token_with_server(
+        client: &Client,
+        device_token: &DeviceToken,
+        server_url: &str,
+    ) -> Result<UserToken, SyncError> {
+        let url = format!("{}/token/json/2/user/new", server_url.trim_end_matches('/'));
         
         let resp = client
-            .post(url)
+            .post(&url)
             .header(header::AUTHORIZATION, format!("Bearer {}", device_token.token))
             .send()
             .await?;
@@ -711,9 +835,9 @@ pub mod auth {
         match resp.status().as_u16() {
             200 => {
                 let token: String = resp.text().await?;
-                // Parse JWT to extract region and scopes
+                // Parse JWT to extract region and scopes (local server may use different format)
                 let region = parse_jwt_claim(&token, "tectonic")
-                    .unwrap_or_else(|| "eu".to_string());
+                    .unwrap_or_else(|| "local".to_string());
                 let scopes = parse_jwt_scopes(&token);
                 
                 Ok(UserToken { token, region, scopes })

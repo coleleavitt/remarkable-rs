@@ -56,6 +56,8 @@ use remarkable_sync::SyncClient;
 use remarkable_usb::UsbClient;
 use remarkable_screen::RfbClient;
 use serde::{Deserialize, Serialize};
+use reqwest;
+use uuid::Uuid;
 use tabled::{Table, Tabled};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -209,6 +211,25 @@ enum Commands {
     Server {
         #[command(subcommand)]
         action: ServerAction,
+    },
+    
+    /// Pair with a sync server (cloud or local)
+    Pair {
+        /// Server URL (local server) or "cloud" for reMarkable cloud
+        #[arg(short, long, default_value = "cloud")]
+        server: String,
+        
+        /// Skip TLS certificate verification (for self-signed certs)
+        #[arg(long, default_value = "false")]
+        insecure: bool,
+        
+        /// Pairing code (if already have one; otherwise will prompt)
+        #[arg(short, long)]
+        code: Option<String>,
+        
+        /// Device name for registration
+        #[arg(long)]
+        device_name: Option<String>,
     },
     
     /// Configuration management
@@ -576,6 +597,9 @@ async fn main() -> Result<()> {
             cmd_mqtt(action, &device_token, &user_token).await?
         }
         Commands::Server { action } => cmd_server(action).await?,
+        Commands::Pair { server, insecure, code, device_name } => {
+            cmd_pair(&server, insecure, code.as_deref(), device_name.as_deref(), &config).await?
+        }
         Commands::Config { action } => cmd_config(action, &config).await?,
     }
     
@@ -1379,6 +1403,189 @@ async fn cmd_server(action: ServerAction) -> Result<()> {
             println!("Server status: {}", "Not running".yellow());
         }
     }
+    
+    Ok(())
+}
+
+// ============ Pair Command ============
+
+async fn cmd_pair(
+    server: &str,
+    insecure: bool,
+    code: Option<&str>,
+    device_name: Option<&str>,
+    config_dir: &PathBuf,
+) -> Result<()> {
+    use remarkable_sync::local::{LocalServerClient, LocalServerConfig, ServerType};
+    use std::io::{self, Write};
+    
+    println!("{}", "Device Pairing".bold());
+    println!();
+    
+    let is_cloud = server == "cloud" || server.contains("remarkable.com") || server.contains("remarkable.engineering");
+    
+    if is_cloud {
+        println!("  Server: {} (reMarkable Cloud)", "cloud".cyan());
+        println!();
+        println!("  To pair with reMarkable Cloud:");
+        println!("  1. Go to https://my.remarkable.com/device/connect");
+        println!("  2. Log in and get a pairing code");
+        println!("  3. Enter the code below");
+        println!();
+        
+        // Get code
+        let pairing_code = if let Some(c) = code {
+            c.to_string()
+        } else {
+            print!("  Enter pairing code: ");
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            input.trim().to_string()
+        };
+        
+        if pairing_code.len() != 8 {
+            return Err(CliError::Other("Pairing code must be 8 characters".into()));
+        }
+        
+        println!();
+        println!("  {} Pairing with cloud...", "⏳".yellow());
+        
+        // Exchange code for tokens
+        let client = reqwest::Client::new();
+        let device_id = uuid::Uuid::new_v4().to_string();
+        
+        let device_token = remarkable_sync::client::auth::pair_device(&client, &pairing_code, &device_id)
+            .await
+            .map_err(|e| CliError::Other(format!("Pairing failed: {}", e)))?;
+        
+        let user_token = remarkable_sync::client::auth::refresh_user_token(&client, &device_token)
+            .await
+            .map_err(|e| CliError::Other(format!("Token refresh failed: {}", e)))?;
+        
+        // Save tokens
+        std::fs::create_dir_all(config_dir)?;
+        let device_path = config_dir.join("device_token.txt");
+        let user_path = config_dir.join("user_token.txt");
+        
+        std::fs::write(&device_path, &device_token.token)?;
+        std::fs::write(&user_path, &user_token.token)?;
+        
+        println!("  {} Pairing successful!", "✓".green());
+        println!();
+        println!("  Device token saved to: {}", device_path.display());
+        println!("  User token saved to: {}", user_path.display());
+        println!("  Region: {}", user_token.region.cyan());
+        println!("  Scopes: {}", user_token.scopes.join(", ").dimmed());
+        
+    } else {
+        println!("  Server: {} (Local)", server.cyan());
+        
+        // Create local server config
+        let mut config = LocalServerConfig::new(server);
+        if insecure {
+            config = config.with_skip_tls_verify(true);
+            println!("  {} TLS verification disabled", "⚠".yellow());
+        }
+        if let Some(name) = device_name {
+            config = config.with_device_name(name);
+        }
+        
+        // Detect server type
+        println!();
+        print!("  Detecting server type... ");
+        io::stdout().flush()?;
+        
+        let local_client = LocalServerClient::new(config.clone())
+            .map_err(|e| CliError::Other(format!("Failed to create client: {}", e)))?;
+        
+        match local_client.detect_server_type().await {
+            Ok(ServerType::Local(version)) => {
+                println!("{}", format!("remarkable-server v{}", version).green());
+            }
+            Ok(ServerType::Cloud) => {
+                println!("{}", "Detected reMarkable Cloud".yellow());
+                println!("  Use --server cloud for cloud pairing");
+                return Ok(());
+            }
+            Ok(ServerType::Unknown) => {
+                println!("{}", "Unknown server type (proceeding anyway)".yellow());
+            }
+            Err(e) => {
+                println!("{}", format!("Detection failed: {}", e).red());
+                println!("  Proceeding with local server pairing...");
+            }
+        }
+        println!();
+        
+        // Get code
+        let pairing_code = if let Some(c) = code {
+            c.to_string()
+        } else {
+            // Request a pairing code from the server
+            println!("  Requesting pairing code from server...");
+            
+            match local_client.request_pairing_code().await {
+                Ok(resp) => {
+                    println!();
+                    println!("  {} Your pairing code is: {}", "→".cyan(), resp.code.bold().green());
+                    if resp.expires_in > 0 {
+                        println!("    (expires in {} seconds)", resp.expires_in);
+                    }
+                    println!();
+                    println!("  Enter this code on your device to pair.");
+                    println!("  Or press Enter to continue pairing with this code...");
+                    
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input)?;
+                    
+                    resp.code
+                }
+                Err(e) => {
+                    // Code request not supported, ask for manual entry
+                    println!("  {} Could not request code: {}", "!".yellow(), e);
+                    println!();
+                    print!("  Enter pairing code: ");
+                    io::stdout().flush()?;
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input)?;
+                    input.trim().to_string()
+                }
+            }
+        };
+        
+        if pairing_code.is_empty() {
+            return Err(CliError::Other("Pairing code cannot be empty".into()));
+        }
+        
+        println!();
+        println!("  {} Exchanging code for tokens...", "⏳".yellow());
+        
+        // Exchange code
+        let device_id = uuid::Uuid::new_v4().to_string();
+        let tokens = local_client.exchange_code(&pairing_code, &device_id)
+            .await
+            .map_err(|e| CliError::Other(format!("Pairing failed: {}", e)))?;
+        
+        // Save tokens
+        std::fs::create_dir_all(config_dir)?;
+        let device_path = config_dir.join("device_token.txt");
+        let user_path = config_dir.join("user_token.txt");
+        let server_path = config_dir.join("server.txt");
+        
+        std::fs::write(&device_path, &tokens.device_token)?;
+        std::fs::write(&user_path, &tokens.user_token)?;
+        std::fs::write(&server_path, &tokens.server_url)?;
+        
+        println!("  {} Pairing successful!", "✓".green());
+        println!();
+        println!("  Device token saved to: {}", device_path.display());
+        println!("  User token saved to: {}", user_path.display());
+        println!("  Server URL saved to: {}", server_path.display());
+    }
+    
+    println!();
+    println!("  Run `{} sync list` to verify sync access.", "remarkable".cyan());
     
     Ok(())
 }

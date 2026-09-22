@@ -1,10 +1,12 @@
-//! Sync client for reMarkable cloud
+//! Sync client for reMarkable cloud and local servers
 //!
-//! Provides document synchronization with reMarkable cloud services.
+//! Provides document synchronization with reMarkable cloud services
+//! or local remarkable-server instances.
 //!
 //! # Features
 //!
-//! - Device pairing and token refresh
+//! - Device pairing and token refresh (cloud and local)
+//! - Auto-detect server type
 //! - Document listing and download
 //! - Document creation, rename, move, delete
 //! - Folder creation and management
@@ -15,19 +17,20 @@
 //! # Example
 //!
 //! ```ignore
-//! use remarkable_sync::{SyncClient, Resolution, ConflictResolver};
+//! use remarkable_sync::{SyncClient, Resolution, ConflictResolver, ServerConfig};
 //!
-//! // Create client from tokens
+//! // Create client from tokens (auto-detects cloud)
 //! let client = SyncClient::from_token_files("device.txt", "user.txt")?;
 //!
-//! // List documents
-//! let docs = client.list_documents().await?;
+//! // Or create client for local server
+//! let client = SyncClient::new()
+//!     .with_server(ServerConfig::local("http://localhost:8080"));
 //!
-//! // Create a notebook
-//! let doc_id = create_notebook(&client, "My Notebook", None).await?;
-//!
-//! // Download with conflict handling
-//! let resolver = ConflictResolver::new(Resolution::Theirs);
+//! // Pair with local server
+//! use remarkable_sync::local::{LocalServerClient, LocalServerConfig};
+//! let config = LocalServerConfig::new("http://localhost:8080");
+//! let local = LocalServerClient::new(config)?;
+//! let tokens = local.exchange_code("12345678", "device-id").await?;
 //! ```
 //!
 //! # Upload Protocol
@@ -56,9 +59,11 @@ pub mod document_ops;
 pub mod checksum;
 pub mod conflict;
 pub mod merkle;
+pub mod local;
 
 pub use error::SyncError;
 pub use client::*;
 pub use document_ops::*;
 pub use conflict::*;
 pub use merkle::*;
+pub use local::{LocalServerConfig, LocalServerClient, LocalTokens, ServerConfig, ServerType};
