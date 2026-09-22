@@ -1,0 +1,10 @@
+[package]
+name = "remarkable-dbus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "D-Bus client for reMarkable device control"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }

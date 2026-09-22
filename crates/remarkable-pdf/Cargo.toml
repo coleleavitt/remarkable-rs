@@ -1,0 +1,15 @@
+[package]
+name = "remarkable-pdf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "PDF annotation overlay for reMarkable documents"
+
+[dependencies]
+remarkable-core.workspace = true
+remarkable-lines.workspace = true
+thiserror.workspace = true
+
+# PDF rendering
+lopdf = "0.36"

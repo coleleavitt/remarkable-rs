@@ -1,0 +1,10 @@
+[package]
+name = "remarkable-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Text and CrdtTextItem support for reMarkable documents"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "remarkable-graphql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GraphQL client for share.remarkable.com"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

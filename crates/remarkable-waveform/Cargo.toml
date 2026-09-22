@@ -1,0 +1,9 @@
+[package]
+name = "remarkable-waveform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "E-ink waveform parser for reMarkable displays"
+
+[dependencies]
+thiserror = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "remarkable-lines"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Parser for reMarkable .rm stroke files"
+
+[dependencies]
+remarkable-core.workspace = true
+byteorder.workspace = true
+thiserror.workspace = true

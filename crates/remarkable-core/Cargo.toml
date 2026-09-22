@@ -1,0 +1,12 @@
+[package]
+name = "remarkable-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core types for reMarkable documents"
+
+[dependencies]
+serde_json.workspace = true
+serde.workspace = true
+thiserror.workspace = true

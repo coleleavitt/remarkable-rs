@@ -1,0 +1,10 @@
+[package]
+name = "remarkable-firmware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Firmware extractor for reMarkable update files (CrAU v1 + SWUpdate)"
+
+[dependencies]
+thiserror = { workspace = true }
+bzip2 = "0.4"

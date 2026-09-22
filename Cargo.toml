@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/remarkable-cli",
+    "crates/remarkable-core",
+    "crates/remarkable-lines",
+    "crates/remarkable-mqtt",
+    "crates/remarkable-sync",
+    "crates/remarkable-pdf",
+    "crates/remarkable-usb",
+    "crates/remarkable-template",
+    "crates/remarkable-text",
+    "crates/remarkable-epub",
+    "crates/remarkable-waveform",
+    "crates/remarkable-graphql",
+    "crates/remarkable-firmware",
+    "crates/remarkable-screen",
+    "crates/remarkable-dbus",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["reMarkable Research"]
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates (only those used by other crates)
+remarkable-core = { path = "crates/remarkable-core" }
+remarkable-lines = { path = "crates/remarkable-lines" }
+remarkable-sync = { path = "crates/remarkable-sync" }
+remarkable-pdf = { path = "crates/remarkable-pdf" }
+
+# External dependencies (only those actually used)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+byteorder = "1.5"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+uuid = { version = "1.10", features = ["v4", "serde"] }

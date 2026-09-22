@@ -1,0 +1,23 @@
+[package]
+name = "remarkable-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CLI for reMarkable document tools"
+
+[[bin]]
+name = "remarkable"
+path = "src/main.rs"
+
+[dependencies]
+walkdir = "2"
+remarkable-core.workspace = true
+remarkable-lines.workspace = true
+remarkable-sync.workspace = true
+remarkable-pdf.workspace = true
+reqwest.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

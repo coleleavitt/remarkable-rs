@@ -1,0 +1,12 @@
+[package]
+name = "remarkable-template"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Template parser and writer for reMarkable tablet"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+png = "0.17"
