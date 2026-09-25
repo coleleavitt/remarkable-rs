@@ -88,7 +88,12 @@ impl UsbConfig {
 }
 
 /// Device information
+///
+/// `#[non_exhaustive]`: this is an output struct (returned by
+/// [`UsbCapture::get_device_info`]); callers read it rather than build it, and
+/// new fields shouldn't break them.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DeviceInfo {
     pub model: String,
     pub firmware_version: String,
