@@ -71,29 +71,44 @@ impl WebServer {
     pub async fn run(&self) -> Result<()> {
         let viewer = Arc::new(ScreenShareViewer::new(self.source.clone()));
         let (png_tx, latest_png) = watch::channel(None);
-        
+        // Republish the cursor from the same task that encodes frames, so a
+        // frame's PNG is always published before the cursor that belongs on it
+        // (within a tablet message the frame is delivered before the cursor).
+        let (cursor_tx, cursor_rx) = watch::channel(None);
+
         let state = Arc::new(AppState {
             viewer: viewer.clone(),
             latest_png,
-            cursor: viewer.cursor(),
+            cursor: cursor_rx,
         });
-        
+
         // Subscribe before starting so the first frame is not missed.
-        let mut rx = viewer.subscribe();
+        let mut frames = viewer.subscribe();
+        let mut cursor = viewer.cursor();
         viewer.start().await?;
-        
+
         tokio::spawn(async move {
             loop {
-                match rx.recv().await {
-                    Ok(frame) => match frame_to_png(&frame) {
-                        Ok(png) => {
-                            png_tx.send_replace(Some(Arc::new(png)));
-                        }
-                        Err(e) => warn!("Failed to encode frame: {}", e),
+                tokio::select! {
+                    // Encode and publish a frame before handling a cursor, so the
+                    // picture is in place when the cursor lands on it.
+                    biased;
+                    frame = frames.recv() => match frame {
+                        Ok(frame) => match frame_to_png(&frame) {
+                            Ok(png) => {
+                                png_tx.send_replace(Some(Arc::new(png)));
+                            }
+                            Err(e) => warn!("Failed to encode frame: {}", e),
+                        },
+                        // Only the newest frame matters; skip what we missed.
+                        Err(broadcast::error::RecvError::Lagged(n)) => debug!("Skipped {} frames", n),
+                        Err(broadcast::error::RecvError::Closed) => break,
                     },
-                    // Only the newest frame matters; skip what we missed.
-                    Err(broadcast::error::RecvError::Lagged(n)) => debug!("Skipped {} frames", n),
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    changed = cursor.changed() => {
+                        if changed.is_err() { break }
+                        let point = *cursor.borrow_and_update();
+                        cursor_tx.send_replace(point);
+                    }
                 }
             }
         });

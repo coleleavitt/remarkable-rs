@@ -128,12 +128,24 @@ impl ScreenShareViewer {
         self.cursor_tx.subscribe()
     }
 
-    /// Run `producer` as the viewer's only background task.
-    fn replace_task(&self, producer: impl std::future::Future<Output = ()> + Send + 'static) {
+    /// Install `producer` as the viewer's only background task, but only while
+    /// `gen` is still the current generation; returns whether it was installed.
+    ///
+    /// The generation is checked while holding the task lock, so a start that was
+    /// superseded after it began (a newer start already bumped the generation)
+    /// can't install its producer and abort the newer one. When it returns
+    /// `false` the `producer` future is dropped un-polled, running its own
+    /// cleanup (e.g. [`CloudCleanup`]) on drop.
+    fn replace_task(&self, gen: u64, producer: impl std::future::Future<Output = ()> + Send + 'static) -> bool {
+        let mut slot = self.task.lock().unwrap_or_else(|e| e.into_inner());
+        if self.generation.load(Ordering::SeqCst) != gen {
+            return false;
+        }
         let handle = tokio::spawn(producer).abort_handle();
-        if let Some(old) = self.task.lock().unwrap_or_else(|e| e.into_inner()).replace(handle) {
+        if let Some(old) = slot.replace(handle) {
             old.abort();
         }
+        true
     }
 
     /// Start producing frames in the background.
@@ -156,36 +168,45 @@ impl ScreenShareViewer {
             }
         };
 
+        // Build the cleanup guard now, before any task exists, so the session is
+        // torn down even if the producer is aborted before its first poll or is
+        // never installed: its `CloudCleanup` is dropped with the future.
+        let crate::cloud::CloudSession { webrtc, mut data_rx, signaling_task } = session;
+        let cleanup = CloudCleanup::new(webrtc, signaling_task);
+
         // A newer start superseded us while we were connecting: installing this
-        // session would abort that newer producer, so tear this one down instead
-        // (and do it properly, not by leaking it into a never-polled task).
+        // session would abort that newer producer, so tear this one down instead.
         if self.generation.load(Ordering::SeqCst) != gen {
-            let crate::cloud::CloudSession { webrtc, signaling_task, .. } = session;
-            CloudCleanup::new(webrtc, signaling_task).close().await;
+            cleanup.close().await;
             return Ok(());
         }
 
         // Before spawning, so the task's Streaming state can't be overwritten.
         *self.state.write().await = ViewerState::Connected;
-        // A fresh session starts with no cursor, clearing any stale one.
-        self.cursor_tx.send_replace(None);
         let frame_tx = self.frame_tx.clone();
         let cursor_tx = self.cursor_tx.clone();
         let state = self.state.clone();
         let generation = self.generation.clone();
-        self.replace_task(async move {
-            // Own the session here so the peer connection and signaling task live
-            // exactly as long as frames are flowing; `cleanup` tears them down on
-            // both the normal exit and an abort (see `CloudCleanup`).
-            let crate::cloud::CloudSession { webrtc, mut data_rx, signaling_task } = session;
-            let cleanup = CloudCleanup::new(webrtc, signaling_task);
+        // If a newer start slipped in while we took the state lock, `replace_task`
+        // won't install this producer; it is dropped un-polled and its
+        // `CloudCleanup` runs on drop, so nothing leaks.
+        self.replace_task(gen, async move {
+            let mut cleanup = cleanup;
             set_state(&state, &generation, gen, ViewerState::Streaming).await;
+            // A fresh session starts with no cursor, clearing any left by a
+            // superseded predecessor.
+            if generation.load(Ordering::SeqCst) == gen {
+                cursor_tx.send_replace(None);
+            }
             if let Err(e) = pump_frames(&mut data_rx, |update| match update {
                 Update::Frame(frame) => {
                     let _ = frame_tx.send(frame);
                 }
                 Update::Cursor(point) => {
-                    cursor_tx.send_replace(point);
+                    // Don't publish a cursor once a newer session owns the view.
+                    if generation.load(Ordering::SeqCst) == gen {
+                        cursor_tx.send_replace(point);
+                    }
                 }
                 Update::Connected { .. } => {}
             })
@@ -194,9 +215,10 @@ impl ScreenShareViewer {
                 error!("Screen share stream ended: {}", e);
             }
             cleanup.close().await;
-            // The stream is over: drop any cursor so it can't linger over a
-            // later frame.
-            cursor_tx.send_replace(None);
+            // Drop any cursor when our stream ends, unless a newer one took over.
+            if generation.load(Ordering::SeqCst) == gen {
+                cursor_tx.send_replace(None);
+            }
             set_state(&state, &generation, gen, ViewerState::Disconnected).await;
         });
         Ok(())
@@ -219,7 +241,7 @@ impl ScreenShareViewer {
         let frame_tx = self.frame_tx.clone();
         let state = self.state.clone();
         let generation = self.generation.clone();
-        self.replace_task(async move {
+        self.replace_task(gen, async move {
             set_state(&state, &generation, gen, ViewerState::Streaming).await;
             while let Some(frame) = frame_rx.recv().await {
                 let _ = frame_tx.send(frame);
@@ -265,17 +287,28 @@ mod tests {
         let viewer = ScreenShareViewer::new(ViewerSource::Usb(UsbConfig::default()));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let first = tx.clone();
-        viewer.replace_task(async move {
+        let g1 = viewer.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(viewer.replace_task(g1, async move {
             loop {
                 let _ = first.send("first");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        });
+        }));
         tokio::time::sleep(Duration::from_millis(50)).await;
-        viewer.replace_task(async {});
+        let g2 = viewer.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(viewer.replace_task(g2, async {}));
         tokio::time::sleep(Duration::from_millis(50)).await;
         while rx.try_recv().is_ok() {}
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "the first task is still running");
+    }
+
+    #[tokio::test]
+    async fn a_superseded_task_is_not_installed() {
+        let viewer = ScreenShareViewer::new(ViewerSource::Usb(UsbConfig::default()));
+        // A stale generation (a newer start already bumped it) must not install.
+        let stale = viewer.generation.load(Ordering::SeqCst);
+        viewer.generation.fetch_add(1, Ordering::SeqCst);
+        assert!(!viewer.replace_task(stale, async {}));
     }
 }

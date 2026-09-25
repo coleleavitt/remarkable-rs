@@ -24,7 +24,11 @@ const FB_WIDTH: u32 = 1404;
 const FB_HEIGHT: u32 = 1872;
 
 /// USB capture configuration
+///
+/// `#[non_exhaustive]` so new fields (like `depth`) can be added without
+/// breaking downstream callers; construct it from [`UsbConfig::default`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UsbConfig {
     pub host: String,
     pub port: u16,
@@ -55,10 +59,27 @@ impl Default for UsbConfig {
 }
 
 impl UsbConfig {
-    /// This config with the framebuffer geometry and pixel depth the device
-    /// actually reports (a Paper Pro is 16-bit RGB565, not 8-bit gray).
+    /// A default config targeting `host` (the way to build one now that the
+    /// struct is `#[non_exhaustive]`).
+    pub fn for_host(host: impl Into<String>) -> Self {
+        Self { host: host.into(), ..Self::default() }
+    }
+
+    /// This config updated from what the device actually reports.
+    ///
+    /// Always takes the detected `depth` (the reason detection exists — a Paper
+    /// Pro is 16-bit RGB565, not 8-bit gray). Keeps caller-supplied dimensions,
+    /// only auto-filling geometry that is still the default, so a config with
+    /// deliberately non-default dimensions (or a custom `fb_device`, which
+    /// `fbset -i` does not describe) is respected rather than overwritten.
     pub(crate) fn with_device(self, info: &DeviceInfo) -> Self {
-        Self { width: info.width, height: info.height, depth: info.depth, ..self }
+        let default_geometry = self.width == FB_WIDTH && self.height == FB_HEIGHT;
+        Self {
+            depth: info.depth,
+            width: if default_geometry { info.width } else { self.width },
+            height: if default_geometry { info.height } else { self.height },
+            ..self
+        }
     }
 }
 
@@ -145,8 +166,14 @@ impl UsbCapture {
         let raw_data = self.run_ssh_command_binary(&format!("cat {}", shell_quote(&self.config.fb_device))).await?;
 
         // Validate size: honour the pixel depth (Paper Pro is 2 bytes/pixel).
+        // Only the two depths reMarkable devices use are supported; anything
+        // else is rejected rather than silently truncated or mislabelled.
         let pixels = self.config.width as usize * self.config.height as usize;
-        let bytes_per_pixel = if self.config.depth == 16 { 2 } else { 1 };
+        let bytes_per_pixel = match self.config.depth {
+            8 => 1,
+            16 => 2,
+            other => return Err(Error::Framebuffer(format!("unsupported framebuffer depth {other} bpp"))),
+        };
         let expected_size = pixels * bytes_per_pixel;
         if raw_data.len() < expected_size {
             return Err(Error::Framebuffer(format!(
@@ -260,9 +287,10 @@ impl Default for UsbCapture {
 
 /// Decode `pixels` framebuffer pixels into a display frame's bytes and format.
 ///
-/// 16-bit depth is little-endian RGB565 (the Paper Pro's colour screen); any
-/// other depth is treated as 8-bit gray (reMarkable 1/2). The caller has already
-/// checked `raw` holds at least `pixels * bytes_per_pixel` bytes.
+/// `depth` is one of the two the caller has already validated: 16 is
+/// little-endian RGB565 (the Paper Pro's colour screen), 8 is gray (reMarkable
+/// 1/2). The caller has also checked `raw` holds at least
+/// `pixels * bytes_per_pixel` bytes.
 fn decode_framebuffer(raw: &[u8], pixels: usize, depth: u32) -> (Vec<u8>, crate::session::PixelFormat) {
     use crate::session::PixelFormat;
     if depth == 16 {

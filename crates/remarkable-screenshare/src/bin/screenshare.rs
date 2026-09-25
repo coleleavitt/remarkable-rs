@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_usb_web_server(port: u16, host: String) -> Result<()> {
-    let source = ViewerSource::Usb(UsbConfig { host, ..Default::default() });
+    let source = ViewerSource::Usb(UsbConfig::for_host(host));
     let server_config = ServerConfig { port, ..Default::default() };
     WebServer::new(server_config, source).run().await
 }
@@ -221,10 +221,7 @@ async fn run_cloud_web_server(
 async fn capture_frame(output: &PathBuf, host: &str) -> Result<()> {
     info!("Capturing frame from {}...", host);
     
-    let config = UsbConfig {
-        host: host.to_string(),
-        ..Default::default()
-    };
+    let config = UsbConfig::for_host(host);
     
     let capture = UsbCapture::with_config(config).detected().await?;
     let frame = capture.capture_frame().await?;
@@ -259,10 +256,7 @@ async fn record_session(
     let recorder = Recorder::new(recording_config);
     let tx = recorder.start().await?;
     
-    let usb_config = UsbConfig {
-        host: host.to_string(),
-        ..Default::default()
-    };
+    let usb_config = UsbConfig::for_host(host);
     
     let capture = UsbCapture::with_config(usb_config).detected().await?;
     let mut frame_rx = capture.start_continuous(fps).await?;
@@ -301,10 +295,7 @@ async fn record_session(
 async fn test_connection(host: &str) -> Result<()> {
     info!("Testing connection to {}...", host);
     
-    let config = UsbConfig {
-        host: host.to_string(),
-        ..Default::default()
-    };
+    let config = UsbConfig::for_host(host);
     
     let capture = UsbCapture::with_config(config);
     
@@ -318,10 +309,7 @@ async fn test_connection(host: &str) -> Result<()> {
 }
 
 async fn show_device_info(host: &str) -> Result<()> {
-    let config = UsbConfig {
-        host: host.to_string(),
-        ..Default::default()
-    };
+    let config = UsbConfig::for_host(host);
     
     let capture = UsbCapture::with_config(config);
     let info = capture.get_device_info().await?;

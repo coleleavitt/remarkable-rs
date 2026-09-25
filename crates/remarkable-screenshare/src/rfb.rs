@@ -121,9 +121,9 @@ impl RfbDecoder {
     /// Feed bytes from the data channel and decode every complete message.
     ///
     /// Stops at a [`Shutdown`](Event::Shutdown): the tablet is done sharing, so
-    /// anything after it is left unparsed and never touches the framebuffer (a
-    /// stray update queued behind the shutdown byte must not alter the last
-    /// delivered frame).
+    /// anything after it is discarded and never touches the framebuffer — a stray
+    /// update queued behind the shutdown byte must not alter the last delivered
+    /// frame, nor resurface if the decoder is fed again.
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<Event>> {
         self.buffer.extend_from_slice(data);
         let mut events = Vec::new();
@@ -131,6 +131,9 @@ impl RfbDecoder {
             let done = event == Event::Shutdown;
             events.push(event);
             if done {
+                // Drop anything queued after the shutdown so a reused decoder
+                // can't parse and apply a post-shutdown update on a later feed.
+                self.buffer.clear();
                 break;
             }
         }
@@ -695,6 +698,9 @@ mod tests {
         let ev = d.feed(&msg).unwrap();
         assert_eq!(ev, vec![Event::Shutdown]);
         // The post-shutdown update never reached the framebuffer.
+        assert!(d.framebuffer().iter().all(|&p| p == 0xffff));
+        // And it was discarded, so a later feed can't resurface it.
+        assert_eq!(d.feed(&[]).unwrap(), vec![]);
         assert!(d.framebuffer().iter().all(|&p| p == 0xffff));
     }
 }
