@@ -78,6 +78,7 @@ pub async fn pump_frames(
         // Union of this message's updates; `None` with `changed` means everything.
         let mut dirty: Option<crate::rfb::Rect> = None;
         let mut everything = false;
+        let mut stopped = false;
         for event in decoder.feed(&data)? {
             match event {
                 Event::Handshake { version, width, height } => {
@@ -103,7 +104,9 @@ pub async fn pump_frames(
                 Event::Ping => debug!("Ping"),
                 Event::Shutdown => {
                     info!("Tablet stopped screen share");
-                    return Ok(());
+                    // Deliver what came before it in this message first.
+                    stopped = true;
+                    break;
                 }
             }
         }
@@ -117,6 +120,9 @@ pub async fn pump_frames(
                 _ => Area { x: 0, y: 0, width, height },
             };
             on_update(Update::Frame(Frame { data, width, height, format, changed, timestamp: Instant::now() }));
+        }
+        if stopped {
+            return Ok(());
         }
     }
 }
@@ -187,6 +193,18 @@ mod tests {
             Area { x: 0, y: 0, width: 4, height: 2 },
             Area { x: 1, y: 1, width: 2, height: 1 },
         ]);
+    }
+
+    #[tokio::test]
+    async fn frame_in_the_shutdown_message_is_delivered() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut msg = handshake(2, 2);
+        msg.extend(update(&[(Rect { x: 0, y: 0, width: 2, height: 2 }, 0)]));
+        msg.push(0x65);
+        tx.send(msg).unwrap();
+        let mut frames = 0;
+        pump_frames(&mut rx, |u| if let Update::Frame(_) = u { frames += 1 }).await.unwrap();
+        assert_eq!(frames, 1);
     }
 
     #[tokio::test]
