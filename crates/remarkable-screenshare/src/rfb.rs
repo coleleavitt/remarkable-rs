@@ -25,7 +25,12 @@
 //!
 //! The inflated framebuffer payload is `rect count` records of
 //! `u16 x, u16 y, u16 w, u16 h, u32 n` followed by `n` bytes of little-endian
-//! RGB565 pixels, `w * 2` bytes per row. Every update is a fresh zlib stream.
+//! RGB565 pixels, `w * 2` bytes per row. Every update is a fresh zlib stream
+//! that the tablet ends with `Z_PARTIAL_FLUSH`, never `Z_FINISH`.
+//!
+//! The format is unchanged from xochitl 3.10.2 through 3.29.0.148 (checked in
+//! each version's `serverprotocol`: same type bytes, `i16` version with
+//! fallback to 2, `QImage::Format_RGB16` pixels, per-update `deflateInit`).
 
 use bytes::{Buf, BytesMut};
 use flate2::{Decompress, FlushDecompress, Status};
@@ -281,9 +286,9 @@ fn be32(b: &[u8], at: usize) -> u32 {
 
 /// Inflate one update's zlib data.
 ///
-/// The tablet starts a new zlib stream per update but only sync-flushes it, so
-/// there is no end-of-stream marker; like the desktop client, inflate until the
-/// input is used up.
+/// The tablet starts a new zlib stream per update and ends it with
+/// `Z_PARTIAL_FLUSH`, so there is no end-of-stream marker; like the desktop
+/// client, inflate until the input is used up.
 fn inflate(input: &[u8]) -> Result<Vec<u8>> {
     let mut z = Decompress::new(true);
     let mut out = Vec::with_capacity(input.len() * 8);
@@ -332,8 +337,7 @@ fn rotate(src: &[u8], w: usize, (dw, dh): (usize, usize), map: impl Fn(usize, us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
+    use flate2::{Compress, Compression, FlushCompress};
 
     fn handshake(w: u16, h: u16) -> Vec<u8> {
         let mut m = vec![msg::HANDSHAKE];
@@ -341,6 +345,22 @@ mod tests {
         m.extend(w.to_be_bytes());
         m.extend(h.to_be_bytes());
         m
+    }
+
+    /// Compress like the tablet: one stream, `Z_PARTIAL_FLUSH` at the end, never finished.
+    fn partial_flushed_zlib(raw: &[u8]) -> Vec<u8> {
+        let mut z = Compress::new(Compression::default(), true);
+        let mut out = Vec::with_capacity(raw.len() + 1024);
+        z.compress_vec(raw, &mut out, FlushCompress::None).unwrap();
+        loop {
+            out.reserve(64 * 1024);
+            let before = out.len();
+            z.compress_vec(&[], &mut out, FlushCompress::Partial).unwrap();
+            if out.len() == before || out.len() < out.capacity() {
+                break;
+            }
+        }
+        out
     }
 
     fn update(rects: &[(Rect, u16)]) -> Vec<u8> {
@@ -355,11 +375,7 @@ mod tests {
                 raw.extend(px.to_le_bytes());
             }
         }
-        // Sync-flushed, never finished: what the tablet sends.
-        let mut enc = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(&raw).unwrap();
-        enc.flush().unwrap();
-        let z = enc.get_ref().clone();
+        let z = partial_flushed_zlib(&raw);
         let mut m = vec![msg::FRAMEBUFFER_UPDATE];
         m.extend((rects.len() as u16).to_be_bytes());
         m.extend((z.len() as u32).to_be_bytes());
