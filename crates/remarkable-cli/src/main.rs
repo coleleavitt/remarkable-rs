@@ -1702,9 +1702,11 @@ async fn screen_share_frame(
         remarkable_screenshare::cloud::connect(cfg).await?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let mut tx = Some(tx);
-    let pump = remarkable_screenshare::pump_frames(&mut data_rx, |frame| {
-        if let Some(tx) = tx.take() {
-            let _ = tx.send(frame);
+    let pump = remarkable_screenshare::pump_frames(&mut data_rx, |update| {
+        if let remarkable_screenshare::Update::Frame(frame) = update {
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(frame);
+            }
         }
     });
     let frame = tokio::select! {

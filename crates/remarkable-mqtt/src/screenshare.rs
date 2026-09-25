@@ -115,9 +115,14 @@ pub enum SignalingEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PeerMessage {
-    /// Ask the tablet for a WebRTC offer; `id` is the requester's client id.
+    /// Ask the tablet for a WebRTC offer. Over MQTT `id` is the requester's
+    /// client id; the desktop's REST client omits it (the sender is the
+    /// notification's `sourceDeviceID`).
     #[serde(rename = "request-offer")]
-    RequestOffer { id: String },
+    RequestOffer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
     /// WebRTC negotiation. xochitl spells the tag `webtrc`.
     #[serde(rename = "webtrc")]
     WebRtc { payload: WebRtcMessage },
@@ -177,7 +182,7 @@ mod tests {
 
         let request_offer = SignalingRequest::Broadcast {
             room_id: "R".into(),
-            payload: PeerMessage::RequestOffer { id: "viewer-1".into() },
+            payload: PeerMessage::RequestOffer { id: Some("viewer-1".into()) },
         };
         assert_eq!(
             serde_json::to_value(&request_offer).unwrap(),
@@ -219,6 +224,13 @@ mod tests {
             SignalingEvent::from_bytes(candidate),
             Some(SignalingEvent::Direct { payload: PeerMessage::WebRtc { payload: WebRtcMessage::Candidate { mid: Some(m), .. } }, .. }) if m == "0"
         ));
+    }
+
+    #[test]
+    fn request_offer_without_id_parses() {
+        let m: PeerMessage = serde_json::from_str(r#"{"type":"request-offer"}"#).unwrap();
+        assert_eq!(m, PeerMessage::RequestOffer { id: None });
+        assert_eq!(serde_json::to_value(&m).unwrap(), json!({"type": "request-offer"}));
     }
 
     #[test]

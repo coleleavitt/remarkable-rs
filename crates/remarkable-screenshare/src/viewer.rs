@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use crate::cloud::CloudConfig;
 use crate::error::{Error, Result};
-use crate::session::{pump_frames, Frame};
+use crate::session::{pump_frames, Frame, Update};
 use crate::usb::{UsbCapture, UsbConfig};
 
 /// Where frames come from.
@@ -94,8 +94,10 @@ impl ScreenShareViewer {
             // exactly as long as frames are flowing.
             let crate::cloud::CloudSession { webrtc, mut data_rx, signaling_task } = session;
             set_state(&state, &generation, gen, ViewerState::Streaming).await;
-            if let Err(e) = pump_frames(&mut data_rx, |frame| {
-                let _ = frame_tx.send(frame);
+            if let Err(e) = pump_frames(&mut data_rx, |update| {
+                if let Update::Frame(frame) = update {
+                    let _ = frame_tx.send(frame);
+                }
             })
             .await
             {

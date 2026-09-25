@@ -131,7 +131,7 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
                     signaler
                         .send(&SignalingRequest::Broadcast {
                             room_id: r.clone(),
-                            payload: PeerMessage::RequestOffer { id: cid.clone() },
+                            payload: PeerMessage::RequestOffer { id: Some(cid.clone()) },
                         })
                         .await?;
                     room_id = Some(r);

@@ -21,7 +21,7 @@
 //! let (webrtc, ice_rx, mut data_rx) = WebRtcHandler::new(TransportConfig::default()).await?;
 //! let answer = webrtc.accept_offer(&tablet_offer).await?;
 //! // ... signal `answer` and the candidates from `ice_rx` to the tablet ...
-//! pump_frames(&mut data_rx, |frame| show(frame)).await?;
+//! pump_frames(&mut data_rx, |update| if let Update::Frame(f) = update { show(f) }).await?;
 //! ```
 
 pub mod error;
@@ -43,5 +43,5 @@ pub mod viewer;
 
 pub use error::{Error, Result};
 pub use rfb::RfbDecoder;
-pub use session::{pump_frames, Frame};
+pub use session::{pump_frames, Frame, Update};
 pub use webrtc::{IceServer, TransportConfig, WebRtcHandler};
