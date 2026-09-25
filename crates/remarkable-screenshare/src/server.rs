@@ -53,6 +53,8 @@ struct AppState {
     /// Latest frame as PNG, so late joiners get a picture straight away
     /// instead of waiting for the tablet screen to change.
     latest_png: watch::Receiver<Option<Arc<Vec<u8>>>>,
+    /// Pen position, forwarded to browsers.
+    cursor: watch::Receiver<Option<(u32, u32)>>,
 }
 
 /// Web server
@@ -75,6 +77,7 @@ impl WebServer {
         let state = Arc::new(AppState {
             viewer: viewer.clone(),
             latest_png,
+            cursor: viewer.cursor(),
         });
         
         // Subscribe before starting so the first frame is not missed.
@@ -142,14 +145,27 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = socket.split();
     let mut latest = state.latest_png.clone();
     latest.mark_changed();
+    let mut cursor = state.cursor.clone();
     
     info!("WebSocket client connected");
     
-    // Send the current frame, then each newer one.
+    // Send the current frame, then each newer one (binary PNG), and pen
+    // moves as `{"cursor":[x,y]}` / `{"cursor":null}` text.
     let send_task = tokio::spawn(async move {
-        while latest.changed().await.is_ok() {
-            let Some(png) = latest.borrow_and_update().clone() else { continue };
-            if sender.send(Message::Binary(png.to_vec())).await.is_err() {
+        loop {
+            let msg = tokio::select! {
+                changed = latest.changed() => {
+                    if changed.is_err() { break }
+                    let Some(png) = latest.borrow_and_update().clone() else { continue };
+                    Message::Binary(png.to_vec())
+                }
+                changed = cursor.changed() => {
+                    if changed.is_err() { break }
+                    let point = *cursor.borrow_and_update();
+                    Message::Text(serde_json::json!({ "cursor": point.map(|(x, y)| [x, y]) }).to_string())
+                }
+            };
+            if sender.send(msg).await.is_err() {
                 break;
             }
         }
@@ -312,6 +328,19 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         const statsEl = document.getElementById('stats');
         
         let ws = null;
+        // Last frame and pen position; the pen is a 15 px dot, as in the
+        // desktop app.
+        let frame = null, cursor = null;
+        function render() {
+            if (!frame) return;
+            ctx.drawImage(frame, 0, 0);
+            if (cursor) {
+                ctx.fillStyle = '#e33';
+                ctx.beginPath();
+                ctx.arc(cursor[0], cursor[1], 7.5, 0, 2 * Math.PI);
+                ctx.fill();
+            }
+        }
         let frameCount = 0;
         let lastFpsTime = Date.now();
         let fpsCount = 0;
@@ -335,6 +364,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             };
             
             ws.onmessage = async (event) => {
+                if (typeof event.data === 'string') {
+                    cursor = JSON.parse(event.data).cursor;
+                    render();
+                    return;
+                }
                 const blob = new Blob([event.data], { type: 'image/png' });
                 const img = new Image();
                 img.onload = () => {
@@ -342,7 +376,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                         canvas.width = img.width;
                         canvas.height = img.height;
                     }
-                    ctx.drawImage(img, 0, 0);
+                    frame = img;
+                    render();
                     frameCount++;
                     fpsCount++;
                     
