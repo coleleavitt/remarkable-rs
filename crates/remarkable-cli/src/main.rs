@@ -1112,6 +1112,9 @@ async fn cmd_device(action: DeviceAction) -> Result<()> {
             if let Some(host) = cloud {
                 let token_path = user_token.ok_or_else(|| CliError::Other("--cloud needs --user-token <file>".into()))?;
                 let user_token = std::fs::read_to_string(&token_path)?.trim().to_string();
+                if user_token.is_empty() {
+                    return Err(CliError::Other(format!("user token file {} is empty", token_path.display())));
+                }
                 println!("Capturing screenshot via screen share ({host})...");
                 let frame = screen_share_frame(remarkable_screenshare::cloud::CloudConfig {
                     host,
@@ -1705,13 +1708,14 @@ async fn screen_share_frame(
         }
     });
     let frame = tokio::select! {
-        frame = rx => frame.ok(),
-        ended = pump => { ended?; None }
-        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => None,
+        frame = rx => Ok(frame.ok()),
+        ended = pump => ended.map(|()| None),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => Ok(None),
     };
+    // Clean up before reporting a stream error.
     signaling_task.abort();
     let _ = webrtc.close().await;
-    frame.ok_or_else(|| CliError::Other("tablet sent no frame".into()))
+    frame?.ok_or_else(|| CliError::Other("tablet sent no frame".into()))
 }
 
 fn write_gray_png(path: &std::path::Path, frame: &remarkable_screenshare::Frame) -> Result<()> {

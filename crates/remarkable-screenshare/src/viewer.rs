@@ -71,6 +71,8 @@ impl ScreenShareViewer {
             }
         };
 
+        // Before spawning, so the task's Streaming state can't be overwritten.
+        *self.state.write().await = ViewerState::Connected;
         let frame_tx = self.frame_tx.clone();
         let state = self.state.clone();
         tokio::spawn(async move {
@@ -89,8 +91,6 @@ impl ScreenShareViewer {
             let _ = webrtc.close().await;
             *state.write().await = ViewerState::Disconnected;
         });
-
-        *self.state.write().await = ViewerState::Connected;
         Ok(())
     }
 
@@ -99,13 +99,14 @@ impl ScreenShareViewer {
         info!("Starting USB viewer...");
 
         let capture = UsbCapture::with_config(usb_config);
-        if !capture.test_connection().await? {
-            return Err(Error::UsbConnection("Cannot connect to device".into()));
-        }
-        let info = capture.get_device_info().await?;
-        info!("Connected to {} running firmware {}", info.model, info.firmware_version);
-
-        let mut frame_rx = capture.start_continuous(10).await?;
+        let mut frame_rx = match Self::open_usb(&capture).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                *self.state.write().await = ViewerState::Error;
+                return Err(e);
+            }
+        };
+        *self.state.write().await = ViewerState::Connected;
         let frame_tx = self.frame_tx.clone();
         let state = self.state.clone();
         tokio::spawn(async move {
@@ -115,9 +116,16 @@ impl ScreenShareViewer {
             }
             *state.write().await = ViewerState::Disconnected;
         });
-
-        *self.state.write().await = ViewerState::Connected;
         Ok(())
+    }
+
+    async fn open_usb(capture: &UsbCapture) -> Result<tokio::sync::mpsc::Receiver<Frame>> {
+        if !capture.test_connection().await? {
+            return Err(Error::UsbConnection("Cannot connect to device".into()));
+        }
+        let info = capture.get_device_info().await?;
+        info!("Connected to {} running firmware {}", info.model, info.firmware_version);
+        capture.start_continuous(10).await
     }
 
     /// Get a single frame

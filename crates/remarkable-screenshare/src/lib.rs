@@ -44,4 +44,4 @@ pub mod viewer;
 pub use error::{Error, Result};
 pub use rfb::RfbDecoder;
 pub use session::{pump_frames, Frame};
-pub use webrtc::{TransportConfig, WebRtcHandler};
+pub use webrtc::{IceServer, TransportConfig, WebRtcHandler};

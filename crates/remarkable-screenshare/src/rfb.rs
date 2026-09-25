@@ -47,6 +47,9 @@ pub const CLIENT_HANDSHAKE: &[u8] = b"reMarkable\x00\x02";
 /// Label of the data channel the tablet opens for screen share.
 pub const CHANNEL_LABEL: &str = "screenshare";
 
+/// Largest framebuffer accepted from a handshake (a Paper Pro is 2160x2880).
+pub const MAX_PIXELS: usize = 4096 * 4096;
+
 /// The desktop client disconnects when no ping arrives for this long.
 pub const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -137,6 +140,10 @@ impl RfbDecoder {
                 }
                 let version = be16(body, 0).max(1);
                 let (width, height) = (be16(body, 2), be16(body, 4));
+                let pixels = width as usize * height as usize;
+                if pixels == 0 || pixels > MAX_PIXELS {
+                    return Err(Error::RfbProtocol(format!("unsupported framebuffer size {width}x{height}")));
+                }
                 self.version = version;
                 self.width = width;
                 self.height = height;
@@ -153,7 +160,13 @@ impl RfbDecoder {
                     trace!("framebuffer update: have {} of {} bytes", body.len() - 6, compressed_len);
                     return Ok(None);
                 }
-                let raw = inflate(&body[6..6 + compressed_len])?;
+                if self.framebuffer.is_empty() {
+                    return Err(Error::RfbProtocol("framebuffer update before handshake".into()));
+                }
+                // A valid update holds at most one 12-byte header per rect and
+                // pixels for the whole framebuffer; allow overlap once over.
+                let limit = 12 * rects as usize + 2 * 2 * self.framebuffer.len();
+                let raw = inflate(&body[6..6 + compressed_len], limit)?;
                 let dirty = self.apply_rects(&raw, rects)?;
                 (Event::FramebufferUpdated { dirty, rects }, 6 + compressed_len)
             }
@@ -189,9 +202,6 @@ impl RfbDecoder {
 
     /// Copy the inflated rects into the framebuffer and return their union.
     fn apply_rects(&mut self, raw: &[u8], count: u16) -> Result<Rect> {
-        if self.framebuffer.is_empty() {
-            return Err(Error::RfbProtocol("framebuffer update before handshake".into()));
-        }
         let (fb_w, fb_h) = (self.width as usize, self.height as usize);
         let mut dirty = Rect::default();
         let mut off = 0;
@@ -222,6 +232,9 @@ impl RfbDecoder {
 
             let (x, y, w, h) = (rect.x as usize, rect.y as usize, rect.width as usize, rect.height as usize);
             // Same checks as the desktop client: skip bad rects, keep going.
+            if w == 0 || h == 0 {
+                continue;
+            }
             if x + w > fb_w || y + h > fb_h {
                 warn!("update rect {rect:?} outside of {fb_w}x{fb_h} framebuffer");
                 continue;
@@ -289,12 +302,17 @@ fn be32(b: &[u8], at: usize) -> u32 {
 /// The tablet starts a new zlib stream per update and ends it with
 /// `Z_PARTIAL_FLUSH`, so there is no end-of-stream marker; like the desktop
 /// client, inflate until the input is used up.
-fn inflate(input: &[u8]) -> Result<Vec<u8>> {
+///
+/// Fails once the output would exceed `limit` bytes.
+fn inflate(input: &[u8], limit: usize) -> Result<Vec<u8>> {
     let mut z = Decompress::new(true);
-    let mut out = Vec::with_capacity(input.len() * 8);
+    let mut out = Vec::with_capacity((input.len() * 8).min(limit));
     loop {
         if out.len() == out.capacity() {
-            out.reserve(out.capacity().max(64 * 1024));
+            if out.len() >= limit {
+                return Err(Error::RfbProtocol(format!("inflated update larger than {limit} bytes")));
+            }
+            out.reserve(out.capacity().max(64 * 1024).min(limit - out.len()));
         }
         let consumed = z.total_in() as usize;
         let status = z
@@ -459,6 +477,36 @@ mod tests {
         expected.extend(CLIENT_VERSION.to_be_bytes());
         assert_eq!(CLIENT_HANDSHAKE, expected.as_slice());
         assert_eq!(CLIENT_HANDSHAKE.len(), 12);
+    }
+
+    #[test]
+    fn oversized_handshake_is_rejected() {
+        let mut d = RfbDecoder::new();
+        assert!(d.feed(&handshake(u16::MAX, u16::MAX)).is_err());
+        let mut d = RfbDecoder::new();
+        assert!(d.feed(&handshake(0, 10)).is_err());
+    }
+
+    #[test]
+    fn zero_sized_rect_is_skipped() {
+        let mut d = RfbDecoder::new();
+        d.feed(&handshake(2, 2)).unwrap();
+        let empty = Rect { x: 0, y: 0, width: 0, height: 2 };
+        let ev = d.feed(&update(&[(empty, 0)])).unwrap();
+        assert_eq!(ev, vec![Event::FramebufferUpdated { dirty: Rect::default(), rects: 1 }]);
+    }
+
+    #[test]
+    fn zlib_bomb_is_rejected() {
+        let mut d = RfbDecoder::new();
+        d.feed(&handshake(4, 4)).unwrap();
+        // 1 rect but megabytes of inflated zeros.
+        let z = testdata::partial_flushed_zlib(&vec![0u8; 4 << 20]);
+        let mut m = vec![msg::FRAMEBUFFER_UPDATE];
+        m.extend(1u16.to_be_bytes());
+        m.extend((z.len() as u32).to_be_bytes());
+        m.extend(z);
+        assert!(d.feed(&m).is_err());
     }
 
     #[test]

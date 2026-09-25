@@ -15,7 +15,7 @@ use remarkable_screenshare::{
     server::{ServerConfig, WebServer, WEB_SERVER_PORT},
     usb::{UsbCapture, UsbConfig},
     viewer::ViewerSource,
-    Result, TransportConfig,
+    IceServer, Result, TransportConfig,
 };
 
 #[derive(Parser)]
@@ -83,7 +83,7 @@ enum Commands {
         output: PathBuf,
         
         /// Frames per second
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..))]
         fps: u32,
         
         /// Duration in seconds (0 for unlimited)
@@ -124,7 +124,7 @@ enum Commands {
         output: PathBuf,
         
         /// Frames per second
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..))]
         fps: u32,
         
         /// Format: webm, mp4
@@ -207,7 +207,7 @@ async fn run_cloud_web_server(
         port: broker_port,
         user_token,
         user_id,
-        transport: TransportConfig { ice_servers: ice, udp_ports: None },
+        transport: TransportConfig { ice_servers: ice.into_iter().map(IceServer::url).collect(), udp_ports: None },
         timeout: Duration::from_secs(30),
     });
 

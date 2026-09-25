@@ -42,7 +42,8 @@ pub async fn pump_frames(
                 }
                 Event::FramebufferUpdated { dirty, rects } => {
                     debug!("Framebuffer update: {rects} rects, dirty {dirty:?}");
-                    changed = true;
+                    // Updates whose rects were all skipped change nothing.
+                    changed |= dirty.width > 0 && dirty.height > 0;
                 }
                 Event::Rotation(degrees) => {
                     info!("Tablet rotation: {degrees}°");
