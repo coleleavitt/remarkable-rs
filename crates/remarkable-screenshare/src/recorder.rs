@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use image::{GrayImage, ImageBuffer};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
@@ -188,10 +187,7 @@ pub struct RecordingStats {
 
 /// Save frame as PNG
 fn save_frame_png(frame: &Frame, path: &Path) -> Result<()> {
-    let img: GrayImage = ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone())
-        .ok_or_else(|| Error::Recording("Invalid frame dimensions".into()))?;
-    
-    img.save(path)
+    frame.to_image()?.save(path)
         .map_err(|e| Error::Recording(format!("Failed to save PNG: {}", e)))?;
     
     Ok(())
@@ -199,11 +195,8 @@ fn save_frame_png(frame: &Frame, path: &Path) -> Result<()> {
 
 /// Save frame as JPEG
 fn save_frame_jpeg(frame: &Frame, path: &Path, quality: u8) -> Result<()> {
-    let img: GrayImage = ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone())
-        .ok_or_else(|| Error::Recording("Invalid frame dimensions".into()))?;
-    
-    // Convert to RGB for JPEG
-    let rgb = image::DynamicImage::ImageLuma8(img).to_rgb8();
+    // JPEG wants RGB either way.
+    let rgb = frame.to_image()?.to_rgb8();
     
     let file = std::fs::File::create(path)
         .map_err(|e| Error::Recording(format!("Failed to create file: {}", e)))?;
