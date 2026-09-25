@@ -17,14 +17,25 @@ pub struct Frame {
     pub timestamp: Instant,
 }
 
-/// Decode the tablet's byte stream and call `on_frame` whenever the picture
-/// changes (at most once per data-channel message).
+/// What [`pump_frames`] reports.
+#[derive(Debug, Clone)]
+pub enum Update {
+    /// The tablet answered the handshake; the session is live.
+    Connected { width: u16, height: u16 },
+    /// The picture changed.
+    Frame(Frame),
+    /// The pen moved, in the rotated frame's pixels; `None` hides the cursor.
+    Cursor(Option<(u32, u32)>),
+}
+
+/// Decode the tablet's byte stream and report each [`Update`]: a frame at most
+/// once per data-channel message, cursor moves as they come.
 ///
 /// Returns `Ok(())` when the tablet stops sharing, and an error when the
 /// channel closes, pings stop for [`PING_TIMEOUT`], or the stream is malformed.
 pub async fn pump_frames(
     data_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
-    mut on_frame: impl FnMut(Frame),
+    mut on_update: impl FnMut(Update),
 ) -> Result<()> {
     let mut decoder = RfbDecoder::new();
     loop {
@@ -39,6 +50,7 @@ pub async fn pump_frames(
             match event {
                 Event::Handshake { version, width, height } => {
                     info!("Screen share handshake: server v{version} {width}x{height}");
+                    on_update(Update::Connected { width, height });
                 }
                 Event::FramebufferUpdated { dirty, rects } => {
                     debug!("Framebuffer update: {rects} rects, dirty {dirty:?}");
@@ -49,7 +61,7 @@ pub async fn pump_frames(
                     info!("Tablet rotation: {degrees}°");
                     changed = decoder.is_ready();
                 }
-                Event::Cursor { x, y } => debug!("Cursor at {x},{y}"),
+                Event::Cursor { x, y } => on_update(Update::Cursor(decoder.display_point(x, y))),
                 Event::Ping => debug!("Ping"),
                 Event::Shutdown => {
                     info!("Tablet stopped screen share");
@@ -59,7 +71,7 @@ pub async fn pump_frames(
         }
         if changed {
             let (data, width, height) = decoder.gray_frame();
-            on_frame(Frame { data, width, height, timestamp: Instant::now() });
+            on_update(Update::Frame(Frame { data, width, height, timestamp: Instant::now() }));
         }
     }
 }
@@ -92,10 +104,19 @@ mod tests {
         tx.send(handshake(4, 2)).unwrap();
         tx.send(update(&[(Rect { x: 0, y: 0, width: 4, height: 2 }, 0)])).unwrap();
         tx.send(vec![0x67]).unwrap(); // ping: no new frame
+        tx.send(vec![0x64, 0, 1, 0, 1]).unwrap(); // cursor: no new frame
         tx.send(vec![0x65]).unwrap(); // tablet stops sharing
 
         let mut frames = Vec::new();
-        pump_frames(&mut rx, |f| frames.push(f)).await.unwrap();
+        let mut connected = false;
+        pump_frames(&mut rx, |u| match u {
+            Update::Frame(f) => frames.push(f),
+            Update::Connected { width, height } => connected = (width, height) == (4, 2),
+            Update::Cursor(_) => {}
+        })
+        .await
+        .unwrap();
+        assert!(connected);
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].width, frames[0].height), (4, 2));
         assert!(frames[0].data.iter().all(|&p| p == 0));

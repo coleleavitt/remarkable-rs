@@ -287,6 +287,23 @@ impl RfbDecoder {
             _ => (gray, w as u32, h as u32),
         }
     }
+
+    /// Where framebuffer point `(x, y)` lands in [`gray_frame`](Self::gray_frame)'s
+    /// rotated image. `None` for (0, 0), which the tablet uses for "no cursor"
+    /// (the desktop app doesn't draw it there), and for points off the screen.
+    pub fn display_point(&self, x: u16, y: u16) -> Option<(u32, u32)> {
+        let (w, h) = (u32::from(self.width), u32::from(self.height));
+        let (x, y) = (u32::from(x), u32::from(y));
+        if (x, y) == (0, 0) || x >= w || y >= h {
+            return None;
+        }
+        Some(match self.rotation.rem_euclid(360) {
+            90 => (h - 1 - y, x),
+            180 => (w - 1 - x, h - 1 - y),
+            270 => (y, w - 1 - x),
+            _ => (x, y),
+        })
+    }
 }
 
 fn be16(b: &[u8], at: usize) -> u16 {
@@ -480,6 +497,25 @@ mod tests {
         expected.extend(CLIENT_VERSION.to_be_bytes());
         assert_eq!(CLIENT_HANDSHAKE, expected.as_slice());
         assert_eq!(CLIENT_HANDSHAKE.len(), 12);
+    }
+
+    #[test]
+    fn display_point_follows_rotation() {
+        let mut d = RfbDecoder::new();
+        d.feed(&handshake(3, 2)).unwrap();
+        assert_eq!(d.display_point(0, 0), None);
+        assert_eq!(d.display_point(3, 0), None);
+        assert_eq!(d.display_point(1, 1), Some((1, 1)));
+        let mut m = vec![msg::ROTATION];
+        m.extend(90i32.to_be_bytes());
+        d.feed(&m).unwrap();
+        // Same mapping as the pixels: a clockwise turn of a 3x2 image.
+        let (gray, w, _) = {
+            d.feed(&update(&[(Rect { x: 2, y: 1, width: 1, height: 1 }, 0)])).unwrap();
+            d.gray_frame()
+        };
+        let (px, py) = d.display_point(2, 1).unwrap();
+        assert_eq!(gray[(py * w + px) as usize], 0);
     }
 
     #[test]

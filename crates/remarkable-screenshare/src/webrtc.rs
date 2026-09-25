@@ -161,7 +161,9 @@ impl WebRtcHandler {
         let state_data_tx = data_tx.clone();
         peer_connection.on_peer_connection_state_change(Box::new(move |s| {
             let state = state_clone.clone();
-            if matches!(s, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
+            // The tablet tears the peer down on Disconnected too (libdatachannel
+            // webrtc.cpp), so the session is over either way.
+            if matches!(s, RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
                 state_data_tx.lock().unwrap().take();
             }
             Box::pin(async move {
