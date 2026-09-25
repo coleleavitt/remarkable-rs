@@ -92,7 +92,7 @@ pub enum Event {
     /// The framebuffer changed; `dirty` is the union of the updated rects.
     FramebufferUpdated { dirty: Rect, rects: u16 },
     Cursor { x: u16, y: u16 },
-    /// Display rotation in degrees (clockwise).
+    /// Tablet rotation in degrees; display turns the other way (see [`RfbDecoder::rotation`]).
     Rotation(i32),
     Ping,
     Shutdown,
@@ -265,7 +265,10 @@ impl RfbDecoder {
         (self.width, self.height)
     }
 
-    /// Display rotation in degrees (clockwise).
+    /// Rotation as the tablet reports it, in degrees. The desktop app turns
+    /// the image the other way (`rotation: -ScreenShareClient.rotation` in
+    /// its screen share QML), so a report of 90 means a quarter turn
+    /// anticlockwise for display.
     pub fn rotation(&self) -> i32 {
         self.rotation
     }
@@ -282,7 +285,7 @@ impl RfbDecoder {
     pub fn frame(&self) -> (Vec<u8>, u32, u32, PixelFormat) {
         let (w, h) = (self.width as usize, self.height as usize);
         let fb = &self.framebuffer;
-        let (pixels, dw, dh) = match self.rotation.rem_euclid(360) {
+        let (pixels, dw, dh) = match self.clockwise_turn() {
             // `map` takes a destination pixel to its source pixel.
             90 => (rotate(fb, w, (h, w), |x, y| (y, h - 1 - x)), h, w),
             180 => (rotate(fb, w, (w, h), |x, y| (w - 1 - x, h - 1 - y)), w, h),
@@ -297,6 +300,11 @@ impl RfbDecoder {
         (data, dw as u32, dh as u32, format)
     }
 
+    /// Clockwise degrees to turn the framebuffer for display: 0, 90, 180 or 270.
+    fn clockwise_turn(&self) -> i32 {
+        (360 - self.rotation.rem_euclid(360)) % 360
+    }
+
     /// Where framebuffer point `(x, y)` lands in [`frame`](Self::frame)'s
     /// rotated image. `None` for (0, 0), which the tablet uses for "no cursor"
     /// (the desktop app doesn't draw it there), and for points off the screen.
@@ -306,7 +314,7 @@ impl RfbDecoder {
         if (x, y) == (0, 0) || x >= w || y >= h {
             return None;
         }
-        Some(match self.rotation.rem_euclid(360) {
+        Some(match self.clockwise_turn() {
             90 => (h - 1 - y, x),
             180 => (w - 1 - x, h - 1 - y),
             270 => (y, w - 1 - x),
@@ -510,8 +518,9 @@ mod tests {
         assert_eq!(d.feed(&m).unwrap(), vec![Event::Rotation(90)]);
         let (gray, w, h, _) = d.frame();
         assert_eq!((w, h), (2, 3));
-        // Top-left source pixel lands top-right after a clockwise turn.
-        assert_eq!(gray[1], 0);
+        // Reported 90 turns the image anticlockwise (as the desktop does):
+        // the top-left source pixel lands bottom-left of the 2x3 result.
+        assert_eq!(gray[2 * 2], 0);
         assert_eq!(gray.iter().filter(|&&p| p == 0).count(), 1);
     }
 

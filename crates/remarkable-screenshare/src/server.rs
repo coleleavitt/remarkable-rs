@@ -329,7 +329,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             if (!frame) return;
             ctx.drawImage(frame, 0, 0);
             if (cursor) {
-                ctx.fillStyle = '#e33';
+                ctx.fillStyle = 'rgba(244, 21, 21, 0.8)'; // desktop QML hoverCursorColor #CCF41515
                 ctx.beginPath();
                 ctx.arc(cursor[0], cursor[1], 7.5, 0, 2 * Math.PI);
                 ctx.fill();
