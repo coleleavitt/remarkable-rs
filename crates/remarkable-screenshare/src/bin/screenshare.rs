@@ -11,13 +11,11 @@ use tracing_subscriber::FmtSubscriber;
 
 use remarkable_screenshare::{
     cloud::CloudConfig,
-    mqtt::MqttConfig,
     recorder::{Recorder, RecordingConfig, RecordingFormat},
-    server::{ServerConfig, WebServer},
-    token::TokenPair,
+    server::{ServerConfig, WebServer, WEB_SERVER_PORT},
     usb::{UsbCapture, UsbConfig},
-    viewer::{ScreenShareViewer, ViewerConfig, ViewerMode},
-    Result, WEB_SERVER_PORT,
+    viewer::ViewerSource,
+    Result, TransportConfig,
 };
 
 #[derive(Parser)]
@@ -41,19 +39,11 @@ enum Commands {
         #[arg(short, long, default_value_t = WEB_SERVER_PORT)]
         port: u16,
         
-        /// Use USB mode (no cloud tokens needed)
-        #[arg(long)]
-        usb: bool,
-        
-        /// Device IP address (USB mode)
+        /// Device IP address (USB mode, used when --cloud is not given)
         #[arg(long, default_value = "10.11.99.1")]
         host: String,
-        
-        /// Device token file (WebRTC mode)
-        #[arg(long)]
-        device_token: Option<PathBuf>,
-        
-        /// User token file (WebRTC / cloud mode)
+
+        /// User token file (cloud mode)
         #[arg(long)]
         user_token: Option<PathBuf>,
 
@@ -162,11 +152,11 @@ async fn main() -> Result<()> {
         .expect("setting default subscriber failed");
     
     match cli.command {
-        Commands::Web { port, usb, host, device_token, user_token, cloud, broker_port, user_id, ice } => {
+        Commands::Web { port, host, user_token, cloud, broker_port, user_id, ice } => {
             if let Some(broker) = cloud {
                 run_cloud_web_server(port, broker, broker_port, user_token, user_id, ice).await
             } else {
-                run_web_server(port, usb, host, device_token, user_token).await
+                run_usb_web_server(port, host).await
             }
         }
         Commands::Capture { output, host } => {
@@ -187,42 +177,10 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_web_server(
-    port: u16,
-    usb: bool,
-    host: String,
-    device_token: Option<PathBuf>,
-    user_token: Option<PathBuf>,
-) -> Result<()> {
-    let viewer_config = if usb {
-        ViewerConfig {
-            mode: ViewerMode::Usb,
-            usb_config: Some(UsbConfig {
-                host,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    } else {
-        let tokens = match (device_token, user_token) {
-            (Some(dt), Some(ut)) => {
-                TokenPair::from_files(dt.to_str().unwrap(), ut.to_str().unwrap())?
-            }
-            _ => {
-                error!("WebRTC mode requires --device-token and --user-token");
-                std::process::exit(1);
-            }
-        };
-        ViewerConfig::webrtc(tokens)
-    };
-    
-    let server_config = ServerConfig {
-        port,
-        ..Default::default()
-    };
-    
-    let server = WebServer::new(server_config, viewer_config);
-    server.run().await
+async fn run_usb_web_server(port: u16, host: String) -> Result<()> {
+    let source = ViewerSource::Usb(UsbConfig { host, ..Default::default() });
+    let server_config = ServerConfig { port, ..Default::default() };
+    WebServer::new(server_config, source).run().await
 }
 
 async fn run_cloud_web_server(
@@ -244,12 +202,12 @@ async fn run_cloud_web_server(
     }
     info!("Cloud mode: broker {}:{}, user id {}", broker, broker_port, user_id);
 
-    let viewer_config = ViewerConfig::cloud(CloudConfig {
+    let source = ViewerSource::Cloud(CloudConfig {
         host: broker,
         port: broker_port,
         user_token,
         user_id,
-        ice_servers: ice,
+        transport: TransportConfig { ice_servers: ice, udp_ports: None },
         timeout: Duration::from_secs(30),
     });
 
@@ -257,7 +215,7 @@ async fn run_cloud_web_server(
         port,
         ..Default::default()
     };
-    WebServer::new(server_config, viewer_config).run().await
+    WebServer::new(server_config, source).run().await
 }
 
 async fn capture_frame(output: &PathBuf, host: &str) -> Result<()> {

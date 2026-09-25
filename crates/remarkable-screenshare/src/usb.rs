@@ -3,18 +3,25 @@
 //! Direct framebuffer capture from USB-connected reMarkable device.
 //! Bypasses cloud entirely for lowest latency.
 
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use image::{GrayImage, ImageBuffer, Luma, RgbImage};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tokio::time;
-use tracing::{debug, error, info, warn};
+use tracing::{error, warn};
 
-use crate::constants::{FB_DEVICE_PATH, FB_HEIGHT, FB_WIDTH, USB_IP, USB_SSH_PORT, USB_USER};
 use crate::error::{Error, Result};
+pub use crate::session::Frame;
+
+/// Tablet address on the USB network.
+const USB_IP: &str = "10.11.99.1";
+const USB_SSH_PORT: u16 = 22;
+const USB_USER: &str = "root";
+const FB_DEVICE_PATH: &str = "/dev/fb0";
+/// Fallback framebuffer size when `fbset` can't be read (reMarkable 1/2, portrait).
+const FB_WIDTH: u32 = 1404;
+const FB_HEIGHT: u32 = 1872;
 
 /// USB capture configuration
 #[derive(Debug, Clone)]
@@ -52,36 +59,6 @@ pub struct DeviceInfo {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
-}
-
-/// Frame data
-#[derive(Debug, Clone)]
-pub struct Frame {
-    pub data: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub timestamp: std::time::Instant,
-}
-
-impl Frame {
-    /// Convert to grayscale image
-    pub fn to_gray_image(&self) -> GrayImage {
-        ImageBuffer::from_raw(self.width, self.height, self.data.clone())
-            .unwrap_or_else(|| GrayImage::new(self.width, self.height))
-    }
-    
-    /// Convert to RGB image (grayscale expanded to RGB)
-    pub fn to_rgb_image(&self) -> RgbImage {
-        let gray = self.to_gray_image();
-        image::DynamicImage::ImageLuma8(gray).to_rgb8()
-    }
-    
-    /// Save frame as PNG
-    pub fn save_png(&self, path: &Path) -> Result<()> {
-        self.to_gray_image()
-            .save(path)
-            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))
-    }
 }
 
 /// USB framebuffer capture

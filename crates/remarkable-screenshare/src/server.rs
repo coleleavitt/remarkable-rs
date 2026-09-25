@@ -20,13 +20,14 @@ use image::codecs::png::PngEncoder;
 use image::{GrayImage, ImageBuffer, ImageEncoder};
 use tokio::sync::{broadcast, watch};
 use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-use crate::constants::WEB_SERVER_PORT;
 use crate::error::{Error, Result};
-use crate::usb::Frame;
-use crate::viewer::{ScreenShareViewer, ViewerConfig, ViewerState};
+use crate::session::Frame;
+use crate::viewer::{ScreenShareViewer, ViewerSource, ViewerState};
+
+/// Default port of the browser viewer.
+pub const WEB_SERVER_PORT: u16 = 8088;
 
 /// Server configuration
 #[derive(Debug, Clone)]
@@ -57,18 +58,18 @@ struct AppState {
 /// Web server
 pub struct WebServer {
     config: ServerConfig,
-    viewer_config: ViewerConfig,
+    source: ViewerSource,
 }
 
 impl WebServer {
     /// Create new web server
-    pub fn new(config: ServerConfig, viewer_config: ViewerConfig) -> Self {
-        Self { config, viewer_config }
+    pub fn new(config: ServerConfig, source: ViewerSource) -> Self {
+        Self { config, source }
     }
     
     /// Run the server
     pub async fn run(&self) -> Result<()> {
-        let viewer = Arc::new(ScreenShareViewer::new(self.viewer_config.clone()));
+        let viewer = Arc::new(ScreenShareViewer::new(self.source.clone()));
         let (png_tx, latest_png) = watch::channel(None);
         
         let state = Arc::new(AppState {
