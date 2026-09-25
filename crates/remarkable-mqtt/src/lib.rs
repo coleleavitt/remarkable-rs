@@ -17,7 +17,7 @@
 //! user/{user_id}/sync                              - User-wide sync events
 //! user/{user_id}/client/{client_id}/notifications  - General notifications
 //! user/{user_id}/client/{client_id}/sync           - Client-specific sync
-//! remarkable/screenshare/signaling/user/{user_id}/client/{client_id}/signaling
+//! remarkable/screenshare/signaling/user/{user_id}/client/{client_id}
 //!                                                  - Screen share signaling (publish)
 //! ```
 //!

@@ -5,8 +5,10 @@
 //!
 //! Wire protocol (verified against a live tablet):
 //!   connect: client_id = username = CID, password = user token
-//!   subscribe: user/{uid}/#
-//!   publish to: remarkable/screenshare/signaling/user/{uid}/client/{CID}/signaling
+//!   subscribe: user/{uid}/signaling and user/{uid}/client/{CID}/signaling/#
+//!   publish to: remarkable/screenshare/signaling/user/{uid}/client/{CID}
+//!   (the topics xochitl's mqttbroker.cpp uses; message types live in
+//!   `remarkable_mqtt::screenshare`)
 //!     1. {"type":"join-active-room","room":"","roomId":""}
 //!        <- {"type":"room-joined","roomId":R,...}   (or {"type":"room-not-found"})
 //!     2. {"type":"broadcast","roomId":R,"payload":{"type":"request-offer","id":"X"}}
@@ -19,13 +21,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use remarkable_mqtt::screenshare::{signaling_topic, subscription};
+use remarkable_mqtt::screenshare::{signaling_topic, subscriptions};
 use remarkable_mqtt::{PeerMessage, SignalingEvent, SignalingRequest, WebRtcMessage};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
-use crate::webrtc::WebRtcHandler;
+use crate::webrtc::{TransportConfig, WebRtcHandler};
 
 /// Settings for cloud (internet) screenshare.
 #[derive(Debug, Clone)]
@@ -38,8 +40,8 @@ pub struct CloudConfig {
     pub user_token: String,
     /// User id used in topics (JWT `sub`/user id claim; "local-user" on remarkable-server)
     pub user_id: String,
-    /// Extra ICE servers (STUN/TURN URLs). Empty = host candidates only (same LAN).
-    pub ice_servers: Vec<String>,
+    /// Local WebRTC setup (ICE servers, UDP port range).
+    pub transport: TransportConfig,
     /// How long to wait for the tablet's offer
     pub timeout: Duration,
 }
@@ -113,7 +115,9 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
         match ev {
             Event::Incoming(Packet::ConnAck(ack)) => {
                 info!("cloud: connected ({:?})", ack.code);
-                client.subscribe(subscription(&uid), QoS::AtLeastOnce).await.map_err(sig_err)?;
+                for filter in subscriptions(&uid, &cid) {
+                    client.subscribe(filter, QoS::AtLeastOnce).await.map_err(sig_err)?;
+                }
                 signaler
                     .send(&SignalingRequest::JoinActiveRoom { room: String::new(), room_id: String::new() })
                     .await?;
@@ -151,8 +155,7 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
     let tablet_cid = tablet_cid.ok_or_else(|| sig_err("offer without clientId"))?;
 
     // --- Phase 2: WebRTC answer ---
-    let stun = if cfg.ice_servers.is_empty() { Some(vec![]) } else { Some(cfg.ice_servers.clone()) };
-    let (webrtc, mut ice_rx, data_rx) = WebRtcHandler::new(stun).await?;
+    let (webrtc, mut ice_rx, data_rx) = WebRtcHandler::new(cfg.transport.clone()).await?;
     let webrtc = Arc::new(webrtc);
     let answer = webrtc.accept_offer(&offer).await?;
 
