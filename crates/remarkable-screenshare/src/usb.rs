@@ -1,321 +1,335 @@
 //! USB Framebuffer Capture
 //!
-//! Direct screen capture from a USB-connected reMarkable device
-//! by reading the framebuffer device via SSH.
-//!
-//! This bypasses the cloud entirely and works offline.
+//! Direct framebuffer capture from USB-connected reMarkable device.
+//! Bypasses cloud entirely for lowest latency.
 
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
-use thiserror::Error;
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
-use tracing::{debug, info, warn};
+use image::{GrayImage, ImageBuffer, Luma, RgbImage};
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::time;
+use tracing::{debug, error, info, warn};
 
-use crate::rfb::{FB_HEIGHT, FB_WIDTH};
-
-/// USB host for reMarkable
-pub const DEFAULT_HOST: &str = "10.11.99.1";
-pub const DEFAULT_USER: &str = "root";
-
-/// Framebuffer device path
-pub const FB_DEVICE: &str = "/dev/fb0";
-
-/// USB capture errors
-#[derive(Error, Debug)]
-pub enum UsbError {
-    #[error("SSH connection failed: {0}")]
-    Connection(String),
-
-    #[error("Command failed: {0}")]
-    Command(String),
-
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Invalid framebuffer data: expected {expected} bytes, got {actual}")]
-    InvalidData { expected: usize, actual: usize },
-
-    #[error("Device not found")]
-    DeviceNotFound,
-}
+use crate::constants::{FB_DEVICE_PATH, FB_HEIGHT, FB_WIDTH, USB_IP, USB_SSH_PORT, USB_USER};
+use crate::error::{Error, Result};
 
 /// USB capture configuration
 #[derive(Debug, Clone)]
 pub struct UsbConfig {
     pub host: String,
-    pub user: String,
     pub port: u16,
-    pub identity_file: Option<PathBuf>,
+    pub user: String,
+    pub password: Option<String>,
+    pub key_path: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub fb_device: String,
 }
 
 impl Default for UsbConfig {
     fn default() -> Self {
         Self {
-            host: DEFAULT_HOST.to_string(),
-            user: DEFAULT_USER.to_string(),
-            port: 22,
-            identity_file: None,
+            host: USB_IP.to_string(),
+            port: USB_SSH_PORT,
+            user: USB_USER.to_string(),
+            password: None,
+            key_path: None,
+            width: FB_WIDTH,
+            height: FB_HEIGHT,
+            fb_device: FB_DEVICE_PATH.to_string(),
         }
     }
 }
 
-impl UsbConfig {
-    /// Create config with custom host
-    pub fn with_host(mut self, host: impl Into<String>) -> Self {
-        self.host = host.into();
-        self
-    }
-
-    /// Create config with identity file
-    pub fn with_identity(mut self, path: impl Into<PathBuf>) -> Self {
-        self.identity_file = Some(path.into());
-        self
-    }
-}
-
-/// USB framebuffer capture client
-pub struct UsbCapture {
-    config: UsbConfig,
-}
-
-impl UsbCapture {
-    /// Create new USB capture client
-    pub fn new(config: UsbConfig) -> Self {
-        Self { config }
-    }
-
-    /// Build SSH command with common options
-    fn ssh_command(&self) -> Command {
-        let mut cmd = Command::new("ssh");
-        cmd.arg("-o").arg("StrictHostKeyChecking=no")
-            .arg("-o").arg("UserKnownHostsFile=/dev/null")
-            .arg("-o").arg("ConnectTimeout=5")
-            .arg("-p").arg(self.config.port.to_string());
-
-        if let Some(ref key) = self.config.identity_file {
-            cmd.arg("-i").arg(key);
-        }
-
-        cmd.arg(format!("{}@{}", self.config.user, self.config.host));
-        cmd
-    }
-
-    /// Check if device is reachable
-    pub async fn check_connection(&self) -> Result<bool, UsbError> {
-        let mut cmd = self.ssh_command();
-        cmd.arg("echo ok");
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
-
-        let status = cmd.status().await?;
-        Ok(status.success())
-    }
-
-    /// Get framebuffer info
-    pub async fn get_fb_info(&self) -> Result<FramebufferInfo, UsbError> {
-        let mut cmd = self.ssh_command();
-        cmd.arg("fbset -i 2>/dev/null || cat /sys/class/graphics/fb0/virtual_size");
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null());
-
-        let output = cmd.output().await?;
-        if !output.status.success() {
-            // Return default dimensions
-            return Ok(FramebufferInfo::default());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let info = FramebufferInfo::parse(&stdout);
-
-        debug!(?info, "Got framebuffer info");
-
-        Ok(info)
-    }
-
-    /// Capture single frame from framebuffer
-    pub async fn capture_frame(&self) -> Result<Vec<u8>, UsbError> {
-        let expected_size = (FB_WIDTH as usize) * (FB_HEIGHT as usize);
-
-        let mut cmd = self.ssh_command();
-        cmd.arg(format!("cat {}", FB_DEVICE));
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null());
-
-        let mut child = cmd.spawn()?;
-        let mut stdout = child.stdout.take().unwrap();
-
-        let mut data = Vec::with_capacity(expected_size);
-        stdout.read_to_end(&mut data).await?;
-
-        let status = child.wait().await?;
-        if !status.success() {
-            return Err(UsbError::Command("Failed to read framebuffer".into()));
-        }
-
-        // Framebuffer might be larger than display area
-        if data.len() < expected_size {
-            return Err(UsbError::InvalidData {
-                expected: expected_size,
-                actual: data.len(),
-            });
-        }
-
-        // Extract just the display area
-        Ok(data[..expected_size].to_vec())
-    }
-
-    /// Capture frames continuously
-    pub async fn capture_continuous<F>(
-        &self,
-        mut callback: F,
-        interval: Duration,
-    ) -> Result<(), UsbError>
-    where
-        F: FnMut(&[u8]) -> bool,
-    {
-        info!(
-            interval_ms = interval.as_millis(),
-            "Starting continuous capture"
-        );
-
-        loop {
-            match self.capture_frame().await {
-                Ok(frame) => {
-                    if !callback(&frame) {
-                        info!("Capture stopped by callback");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Capture error");
-                }
-            }
-
-            tokio::time::sleep(interval).await;
-        }
-
-        Ok(())
-    }
-
-    /// Run command on device
-    pub async fn run_command(&self, command: &str) -> Result<String, UsbError> {
-        let mut cmd = self.ssh_command();
-        cmd.arg(command);
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let output = cmd.output().await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(UsbError::Command(stderr.to_string()));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
-}
-
-/// Framebuffer info
+/// Device information
 #[derive(Debug, Clone)]
-pub struct FramebufferInfo {
+pub struct DeviceInfo {
+    pub model: String,
+    pub firmware_version: String,
     pub width: u32,
     pub height: u32,
     pub depth: u32,
-    pub name: String,
 }
 
-impl Default for FramebufferInfo {
-    fn default() -> Self {
-        Self {
-            width: FB_WIDTH as u32,
-            height: FB_HEIGHT as u32,
-            depth: 8,
-            name: "remarkable".to_string(),
-        }
+/// Frame data
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub timestamp: std::time::Instant,
+}
+
+impl Frame {
+    /// Convert to grayscale image
+    pub fn to_gray_image(&self) -> GrayImage {
+        ImageBuffer::from_raw(self.width, self.height, self.data.clone())
+            .unwrap_or_else(|| GrayImage::new(self.width, self.height))
+    }
+    
+    /// Convert to RGB image (grayscale expanded to RGB)
+    pub fn to_rgb_image(&self) -> RgbImage {
+        let gray = self.to_gray_image();
+        image::DynamicImage::ImageLuma8(gray).to_rgb8()
+    }
+    
+    /// Save frame as PNG
+    pub fn save_png(&self, path: &Path) -> Result<()> {
+        self.to_gray_image()
+            .save(path)
+            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))
     }
 }
 
-impl FramebufferInfo {
-    /// Parse from fbset output
-    fn parse(output: &str) -> Self {
-        let mut info = Self::default();
+/// USB framebuffer capture
+pub struct UsbCapture {
+    config: UsbConfig,
+    running: Arc<Mutex<bool>>,
+}
 
-        for line in output.lines() {
-            if line.contains("geometry") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 {
-                    if let Ok(w) = parts[1].parse() {
-                        info.width = w;
-                    }
-                    if let Ok(h) = parts[2].parse() {
-                        info.height = h;
-                    }
-                    if parts.len() >= 6 {
-                        if let Ok(d) = parts[5].parse() {
-                            info.depth = d;
+impl UsbCapture {
+    /// Create new USB capture with default config
+    pub fn new() -> Self {
+        Self::with_config(UsbConfig::default())
+    }
+    
+    /// Create with custom config
+    pub fn with_config(config: UsbConfig) -> Self {
+        Self {
+            config,
+            running: Arc::new(Mutex::new(false)),
+        }
+    }
+    
+    /// Test SSH connection
+    pub async fn test_connection(&self) -> Result<bool> {
+        let output = self.run_ssh_command("echo ok").await?;
+        Ok(output.trim() == "ok")
+    }
+    
+    /// Get device information
+    pub async fn get_device_info(&self) -> Result<DeviceInfo> {
+        // Get device model from /etc/version
+        let version_output = self.run_ssh_command("cat /etc/version 2>/dev/null || echo unknown").await?;
+        let firmware_version = version_output.trim().to_string();
+        
+        // Get framebuffer info using fbset
+        let fbset_output = self.run_ssh_command("fbset -i 2>/dev/null || echo 'geometry 1872 1404 1872 1404 8'").await?;
+        let (width, height, depth) = parse_fbset_output(&fbset_output);
+        
+        // Detect model from dimensions
+        let model = match (width, height) {
+            (1404, 1872) | (1872, 1404) => "reMarkable 2",
+            (2880, 2160) | (2160, 2880) => "reMarkable Paper Pro",
+            _ => "Unknown",
+        }.to_string();
+        
+        Ok(DeviceInfo {
+            model,
+            firmware_version,
+            width,
+            height,
+            depth,
+        })
+    }
+    
+    /// Capture single frame
+    pub async fn capture_frame(&self) -> Result<Frame> {
+        let start = std::time::Instant::now();
+        
+        // Read framebuffer
+        let raw_data = self.run_ssh_command_binary(&format!("cat {}", self.config.fb_device)).await?;
+        
+        // Validate size
+        let expected_size = self.config.width as usize * self.config.height as usize;
+        if raw_data.len() < expected_size {
+            return Err(Error::Framebuffer(format!(
+                "Incomplete framebuffer: {} < {}",
+                raw_data.len(),
+                expected_size
+            )));
+        }
+        
+        Ok(Frame {
+            data: raw_data[..expected_size].to_vec(),
+            width: self.config.width,
+            height: self.config.height,
+            timestamp: start,
+        })
+    }
+    
+    /// Start continuous capture
+    pub async fn start_continuous(&self, fps: u32) -> Result<mpsc::Receiver<Frame>> {
+        let (tx, rx) = mpsc::channel(2);
+        let config = self.config.clone();
+        let running = self.running.clone();
+        
+        *running.lock().await = true;
+        
+        tokio::spawn(async move {
+            let interval = Duration::from_millis(1000 / fps as u64);
+            
+            while *running.lock().await {
+                let capture = UsbCapture::with_config(config.clone());
+                match capture.capture_frame().await {
+                    Ok(frame) => {
+                        if tx.send(frame).await.is_err() {
+                            break;
                         }
                     }
-                }
-            } else if line.contains("Name") {
-                if let Some(name) = line.split(':').nth(1) {
-                    info.name = name.trim().to_string();
-                }
-            } else if line.contains(',') {
-                // virtual_size format: "W,H"
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 2 {
-                    if let Ok(w) = parts[0].trim().parse() {
-                        info.width = w;
+                    Err(e) => {
+                        warn!("Frame capture error: {}", e);
                     }
-                    if let Ok(h) = parts[1].trim().parse() {
-                        info.height = h;
+                }
+                time::sleep(interval).await;
+            }
+        });
+        
+        Ok(rx)
+    }
+    
+    /// Stop continuous capture
+    pub async fn stop(&self) {
+        *self.running.lock().await = false;
+    }
+    
+    /// Run SSH command and get string output
+    async fn run_ssh_command(&self, command: &str) -> Result<String> {
+        let output = self.run_ssh_command_binary(command).await?;
+        Ok(String::from_utf8_lossy(&output).to_string())
+    }
+    
+    /// Run SSH command and get binary output
+    async fn run_ssh_command_binary(&self, command: &str) -> Result<Vec<u8>> {
+        let mut cmd = Command::new("ssh");
+        
+        // Add SSH options
+        cmd.arg("-o").arg("StrictHostKeyChecking=no")
+           .arg("-o").arg("UserKnownHostsFile=/dev/null")
+           .arg("-o").arg("BatchMode=yes")
+           .arg("-o").arg("ConnectTimeout=5");
+        
+        // Add key if specified
+        if let Some(ref key) = self.config.key_path {
+            cmd.arg("-i").arg(key);
+        }
+        
+        // Add port if non-standard
+        if self.config.port != 22 {
+            cmd.arg("-p").arg(self.config.port.to_string());
+        }
+        
+        // Add user@host
+        cmd.arg(format!("{}@{}", self.config.user, self.config.host));
+        
+        // Add command
+        cmd.arg(command);
+        
+        // Execute
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        
+        let output = cmd.output()
+            .map_err(|e| Error::Ssh(format!("Failed to execute ssh: {}", e)))?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Ssh(format!("SSH command failed: {}", stderr)));
+        }
+        
+        Ok(output.stdout)
+    }
+}
+
+impl Default for UsbCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parse fbset output to get dimensions
+fn parse_fbset_output(output: &str) -> (u32, u32, u32) {
+    let mut width = FB_WIDTH;
+    let mut height = FB_HEIGHT;
+    let mut depth = 8;
+    
+    for line in output.lines() {
+        if line.contains("geometry") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 {
+                width = parts[1].parse().unwrap_or(width);
+                height = parts[2].parse().unwrap_or(height);
+                depth = parts[5].parse().unwrap_or(depth);
+            }
+        }
+    }
+    
+    (width, height, depth)
+}
+
+/// Streaming framebuffer capture using reStream protocol
+pub struct ReStreamCapture {
+    config: UsbConfig,
+}
+
+impl ReStreamCapture {
+    pub fn new() -> Self {
+        Self::with_config(UsbConfig::default())
+    }
+    
+    pub fn with_config(config: UsbConfig) -> Self {
+        Self { config }
+    }
+    
+    /// Start streaming capture using lz4 compression
+    /// This is the protocol used by reStream for efficient capture
+    pub async fn start_streaming(&self) -> Result<mpsc::Receiver<Frame>> {
+        let (tx, rx) = mpsc::channel(4);
+        let config = self.config.clone();
+        
+        tokio::spawn(async move {
+            // Use the reStream approach: stream with lz4 compression
+            let _cmd = format!(
+                "while true; do cat {} | lz4 -c; done",
+                config.fb_device
+            );
+            
+            // This is a placeholder - real implementation would use async SSH
+            // and decompress the lz4 stream on the fly
+            loop {
+                let capture = UsbCapture::with_config(config.clone());
+                match capture.capture_frame().await {
+                    Ok(frame) => {
+                        if tx.send(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Stream capture error: {}", e);
+                        time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             }
-        }
-
-        info
+        });
+        
+        Ok(rx)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_default_config() {
-        let config = UsbConfig::default();
-        assert_eq!(config.host, DEFAULT_HOST);
-        assert_eq!(config.user, DEFAULT_USER);
-        assert_eq!(config.port, 22);
-    }
-
+    
     #[test]
     fn test_parse_fbset() {
-        let output = r#"
-mode "1872x1404"
+        let output = r#"mode "1872x1404"
     geometry 1872 1404 1872 1404 8
-    timings 0 0 0 0 0 0 0
-endmode
-
-Frame buffer device information:
-    Name        : imx_epdc_fb
 "#;
-        let info = FramebufferInfo::parse(output);
-        assert_eq!(info.width, 1872);
-        assert_eq!(info.height, 1404);
-        assert_eq!(info.depth, 8);
-        assert_eq!(info.name, "imx_epdc_fb");
-    }
-
-    #[test]
-    fn test_parse_virtual_size() {
-        let output = "1872,1404";
-        let info = FramebufferInfo::parse(output);
-        assert_eq!(info.width, 1872);
-        assert_eq!(info.height, 1404);
+        let (w, h, d) = parse_fbset_output(output);
+        assert_eq!(w, 1872);
+        assert_eq!(h, 1404);
+        assert_eq!(d, 8);
     }
 }

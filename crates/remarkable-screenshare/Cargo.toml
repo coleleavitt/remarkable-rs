@@ -4,57 +4,74 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "reMarkable screen share viewer - MQTT signaling + WebRTC DataChannel + RFB"
-keywords = ["remarkable", "screenshare", "webrtc", "rfb", "vnc"]
+description = "reMarkable screen share viewer - MQTT signaling + WebRTC DataChannel + RFB v2"
+keywords = ["remarkable", "screenshare", "webrtc", "rfb"]
 
 [[bin]]
 name = "screenshare"
 path = "src/bin/screenshare.rs"
 
-[[bin]]
-name = "usb-capture"
-path = "src/bin/usb_capture.rs"
-
 [dependencies]
-# Internal crates
+# Async runtime
+tokio.workspace = true
+futures.workspace = true
+async-trait = "0.1"
 
-# WebRTC
-webrtc = "0.12"
+# WebRTC. Fork adds SettingEngine::set_sctp_max_message_size_can_receive, which
+# the tablet's >64 KiB frames need; switch back to crates.io once
+# https://github.com/webrtc-rs/webrtc/pull/908 is released.
+webrtc = { git = "https://github.com/coleleavitt/webrtc", branch = "fix/datachannel-max-message-size" }
 
-# MQTT
-rumqttc = "0.24"
+# MQTT client
+rumqttc.workspace = true
 
-# Display
-minifb = "0.27"
+# SSH for USB capture
+russh = "0.46"
+russh-keys = "0.46"
 
 # Image processing
-image = { version = "0.25", features = ["png", "gif"] }
+image = { version = "0.25", features = ["png", "jpeg", "gif", "bmp"] }
 
-# Async runtime
-tokio = { version = "1.0", features = ["full", "sync", "rt-multi-thread"] }
-futures = "0.3"
+# Video recording (WebM/MP4 via gstreamer)
+gstreamer = { version = "0.23", optional = true }
+gstreamer-app = { version = "0.23", optional = true }
+gstreamer-video = { version = "0.23", optional = true }
+
+# Web server for browser viewer
+axum = { version = "0.7", features = ["ws"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
 
-# Encoding
-base64 = "0.22"
-byteorder = "1.5"
-flate2 = "1.0"
+# JWT decoding (for token parsing)
+jsonwebtoken = "9"
 
-# Bytes
-bytes = "1.10"
+# CLI
+clap.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow = "1"
 
 # Utilities
-thiserror = "2.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4.5", features = ["derive"] }
-uuid = { version = "1.10", features = ["v4"] }
-chrono = "0.4"
-
+bytes = "1"
+uuid.workspace = true
+chrono.workspace = true
+url = "2"
+flate2 = "1.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
-tempfile = "3"
+
+[features]
+default = []
+recording = ["gstreamer", "gstreamer-app", "gstreamer-video"]
