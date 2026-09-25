@@ -1,328 +1,386 @@
 //! reMarkable Screen Share CLI
 //!
-//! Usage:
-//!     screenshare --device-token <path> --user-token <path>
-//!     screenshare --tokens-dir ~/SiteResearch/remarkable/captured_tokens
-//!
-//! The device must have screen share enabled for cloud mode to work.
+//! A command-line tool for screen sharing with reMarkable tablets.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
-use remarkable_screenshare::{ClientConfig, ScreenShareClient};
-use tracing::{error, info};
+use clap::{Parser, Subcommand};
+use tracing::{error, info, Level};
+use tracing_subscriber::FmtSubscriber;
+
+use remarkable_screenshare::{
+    cloud::CloudConfig,
+    mqtt::MqttConfig,
+    recorder::{Recorder, RecordingConfig, RecordingFormat},
+    server::{ServerConfig, WebServer},
+    token::TokenPair,
+    usb::{UsbCapture, UsbConfig},
+    viewer::{ScreenShareViewer, ViewerConfig, ViewerMode},
+    Result, WEB_SERVER_PORT,
+};
 
 #[derive(Parser)]
-#[command(name = "screenshare")]
-#[command(about = "reMarkable screen share viewer")]
+#[command(name = "remarkable-screenshare")]
+#[command(about = "Screen share viewer for reMarkable tablets")]
 #[command(version)]
 struct Cli {
+    /// Verbosity level (-v, -vv, -vvv)
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    
     #[command(subcommand)]
-    command: Option<Commands>,
-
-    /// Device token file path
-    #[arg(long)]
-    device_token: Option<PathBuf>,
-
-    /// User token file path
-    #[arg(long)]
-    user_token: Option<PathBuf>,
-
-    /// Tokens directory (contains device_token_actual.txt and user_token_actual.txt)
-    #[arg(long)]
-    tokens_dir: Option<PathBuf>,
-
-    /// Output directory for frames/recordings
-    #[arg(short, long, default_value = "./frames")]
-    output: PathBuf,
-
-    /// Disable display window (headless mode)
-    #[arg(long)]
-    headless: bool,
-
-    /// Record to GIF
-    #[arg(long)]
-    gif: bool,
-
-    /// GIF frame delay in ms
-    #[arg(long, default_value = "100")]
-    gif_delay: u32,
-
-    /// Save PNG snapshots
-    #[arg(long)]
-    snapshots: bool,
-
-    /// Snapshot interval in seconds
-    #[arg(long, default_value = "60")]
-    snapshot_interval: u64,
-
-    /// Verbose output
-    #[arg(short, long)]
-    verbose: bool,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start cloud screen share (MQTT + WebRTC)
-    Cloud(CloudArgs),
+    /// Start web viewer (browser-based)
+    Web {
+        /// Web server port
+        #[arg(short, long, default_value_t = WEB_SERVER_PORT)]
+        port: u16,
+        
+        /// Use USB mode (no cloud tokens needed)
+        #[arg(long)]
+        usb: bool,
+        
+        /// Device IP address (USB mode)
+        #[arg(long, default_value = "10.11.99.1")]
+        host: String,
+        
+        /// Device token file (WebRTC mode)
+        #[arg(long)]
+        device_token: Option<PathBuf>,
+        
+        /// User token file (WebRTC / cloud mode)
+        #[arg(long)]
+        user_token: Option<PathBuf>,
 
-    /// Capture via USB (SSH to device)
-    Usb(UsbArgs),
+        /// Cloud mode: hostname of your self-hosted remarkable-server broker
+        /// (e.g. remarkable.unwrap.rs). Signaling goes over TLS to this host.
+        #[arg(long)]
+        cloud: Option<String>,
 
-    /// Show protocol info
-    Info,
-}
+        /// Cloud mode: broker TLS port
+        #[arg(long, default_value_t = 8883)]
+        broker_port: u16,
 
-#[derive(Args)]
-struct CloudArgs {
-    /// Device token file
-    #[arg(long)]
-    device_token: Option<PathBuf>,
+        /// Cloud mode: user id used in signaling topics
+        #[arg(long, default_value = "local-user")]
+        user_id: String,
 
-    /// User token file
-    #[arg(long)]
-    user_token: Option<PathBuf>,
-}
-
-#[derive(Args)]
-struct UsbArgs {
-    /// Device host (default: 10.11.99.1)
-    #[arg(long, default_value = "10.11.99.1")]
-    host: String,
-
-    /// SSH user (default: root)
-    #[arg(long, default_value = "root")]
-    user: String,
-
-    /// SSH port
-    #[arg(long, default_value = "22")]
-    port: u16,
-
-    /// SSH identity file
-    #[arg(short, long)]
-    identity: Option<PathBuf>,
-
-    /// Continuous capture mode
-    #[arg(long)]
-    continuous: bool,
-
-    /// Capture interval in ms
-    #[arg(long, default_value = "500")]
-    interval: u64,
+        /// Cloud mode: extra STUN/TURN server URL (repeatable), e.g. stun:stun.l.google.com:19302
+        #[arg(long = "ice")]
+        ice: Vec<String>,
+    },
+    
+    /// Capture single frame
+    Capture {
+        /// Output file path
+        #[arg(short, long, default_value = "frame.png")]
+        output: PathBuf,
+        
+        /// Device IP address
+        #[arg(long, default_value = "10.11.99.1")]
+        host: String,
+    },
+    
+    /// Start continuous capture with recording
+    Record {
+        /// Output directory
+        #[arg(short, long, default_value = "recording")]
+        output: PathBuf,
+        
+        /// Frames per second
+        #[arg(long, default_value_t = 10)]
+        fps: u32,
+        
+        /// Duration in seconds (0 for unlimited)
+        #[arg(short, long, default_value_t = 0)]
+        duration: u64,
+        
+        /// Device IP address
+        #[arg(long, default_value = "10.11.99.1")]
+        host: String,
+        
+        /// Recording format: png, jpg
+        #[arg(long, default_value = "png")]
+        format: String,
+    },
+    
+    /// Test connection to device
+    Test {
+        /// Device IP address
+        #[arg(long, default_value = "10.11.99.1")]
+        host: String,
+    },
+    
+    /// Show device info
+    Info {
+        /// Device IP address
+        #[arg(long, default_value = "10.11.99.1")]
+        host: String,
+    },
+    
+    /// Create video from recorded frames
+    Encode {
+        /// Input pattern (e.g., "recording/frame_%06d.png")
+        #[arg(short, long)]
+        input: String,
+        
+        /// Output file
+        #[arg(short, long)]
+        output: PathBuf,
+        
+        /// Frames per second
+        #[arg(long, default_value_t = 10)]
+        fps: u32,
+        
+        /// Format: webm, mp4
+        #[arg(long, default_value = "webm")]
+        format: String,
+    },
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    // Initialize tracing
-    let filter = if cli.verbose {
-        "remarkable_screenshare=debug,rumqttc=debug,webrtc=debug"
-    } else {
-        "remarkable_screenshare=info"
+    
+    // Set up logging
+    let level = match cli.verbose {
+        0 => Level::INFO,
+        1 => Level::DEBUG,
+        _ => Level::TRACE,
     };
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| filter.into()),
-        )
-        .init();
-
+    
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(level)
+        .with_target(false)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("setting default subscriber failed");
+    
     match cli.command {
-        Some(Commands::Info) => {
-            println!("reMarkable Screen Share Protocol");
-            println!();
-            println!("Cloud Mode:");
-            println!("  - MQTT Broker: vernemq-prod.cloud.remarkable.engineering:443");
-            println!("  - Signaling: MQTT WebSocket + TLS");
-            println!("  - Transport: WebRTC DataChannel");
-            println!("  - Protocol: RFB 3.8");
-            println!();
-            println!("Framebuffer:");
-            println!("  - Resolution: 1872x1404");
-            println!("  - Format: 8-bit grayscale");
-            println!("  - Size: {} bytes", 1872 * 1404);
-            println!();
-            println!("USB Mode:");
-            println!("  - Host: 10.11.99.1 (USB connection)");
-            println!("  - Protocol: SSH + cat /dev/fb0");
-            println!("  - Requirements: SSH access to device");
-            Ok(())
-        }
-
-        Some(Commands::Usb(args)) => {
-            use remarkable_screenshare::{UsbCapture, UsbConfig};
-
-            let mut config = UsbConfig::default()
-                .with_host(&args.host);
-
-            if let Some(ref identity) = args.identity {
-                config = config.with_identity(identity);
-            }
-
-            let capture = UsbCapture::new(config);
-
-            info!(host = %args.host, "Checking device connection...");
-
-            if !capture.check_connection().await? {
-                error!("Cannot connect to device at {}", args.host);
-                return Err("Device not reachable".into());
-            }
-
-            let fb_info = capture.get_fb_info().await?;
-            info!(
-                width = fb_info.width,
-                height = fb_info.height,
-                depth = fb_info.depth,
-                name = %fb_info.name,
-                "Framebuffer info"
-            );
-
-            // Create output directory
-            std::fs::create_dir_all(&cli.output)?;
-
-            if args.continuous {
-                use remarkable_screenshare::{Display, PngExporter};
-                use std::time::Duration;
-
-                let mut display = if !cli.headless {
-                    Some(Display::with_dimensions(
-                        "reMarkable USB Capture",
-                        fb_info.width as usize,
-                        fb_info.height as usize,
-                    )?)
-                } else {
-                    None
-                };
-
-                let mut exporter = PngExporter::new(&cli.output, "usb")?;
-
-                info!(
-                    interval_ms = args.interval,
-                    "Starting continuous capture"
-                );
-
-                loop {
-                    match capture.capture_frame().await {
-                        Ok(frame) => {
-                            if let Some(ref mut disp) = display {
-                                if disp.should_close() {
-                                    break;
-                                }
-                                disp.update_grayscale(&frame)?;
-                            }
-
-                            if cli.snapshots {
-                                exporter.export_grayscale(
-                                    &frame,
-                                    fb_info.width,
-                                    fb_info.height,
-                                )?;
-                            }
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Capture error");
-                        }
-                    }
-
-                    tokio::time::sleep(Duration::from_millis(args.interval)).await;
-                }
+        Commands::Web { port, usb, host, device_token, user_token, cloud, broker_port, user_id, ice } => {
+            if let Some(broker) = cloud {
+                run_cloud_web_server(port, broker, broker_port, user_token, user_id, ice).await
             } else {
-                // Single capture
-                info!("Capturing single frame...");
-                let frame = capture.capture_frame().await?;
-
-                let path = cli.output.join("capture.png");
-                remarkable_screenshare::export::save_frame_png(
-                    &frame,
-                    fb_info.width,
-                    fb_info.height,
-                    &path,
-                )?;
-
-                info!(path = %path.display(), "Saved capture");
+                run_web_server(port, usb, host, device_token, user_token).await
             }
-
-            Ok(())
         }
-
-        Some(Commands::Cloud(ref cloud_args)) => {
-            run_cloud(&cli, Some(cloud_args)).await
+        Commands::Capture { output, host } => {
+            capture_frame(&output, &host).await
         }
-
-        None => {
-            run_cloud(&cli, None).await
+        Commands::Record { output, fps, duration, host, format } => {
+            record_session(&output, fps, duration, &host, &format).await
+        }
+        Commands::Test { host } => {
+            test_connection(&host).await
+        }
+        Commands::Info { host } => {
+            show_device_info(&host).await
+        }
+        Commands::Encode { input, output, fps, format } => {
+            encode_video(&input, &output, fps, &format).await
         }
     }
 }
 
-async fn run_cloud(cli: &Cli, cloud_args: Option<&CloudArgs>) -> Result<(), Box<dyn std::error::Error>> {
-    // Resolve token paths
-    let (device_token_path, user_token_path) = resolve_token_paths(cli, cloud_args)?;
+async fn run_web_server(
+    port: u16,
+    usb: bool,
+    host: String,
+    device_token: Option<PathBuf>,
+    user_token: Option<PathBuf>,
+) -> Result<()> {
+    let viewer_config = if usb {
+        ViewerConfig {
+            mode: ViewerMode::Usb,
+            usb_config: Some(UsbConfig {
+                host,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    } else {
+        let tokens = match (device_token, user_token) {
+            (Some(dt), Some(ut)) => {
+                TokenPair::from_files(dt.to_str().unwrap(), ut.to_str().unwrap())?
+            }
+            _ => {
+                error!("WebRTC mode requires --device-token and --user-token");
+                std::process::exit(1);
+            }
+        };
+        ViewerConfig::webrtc(tokens)
+    };
+    
+    let server_config = ServerConfig {
+        port,
+        ..Default::default()
+    };
+    
+    let server = WebServer::new(server_config, viewer_config);
+    server.run().await
+}
 
-    info!(
-        device_token = %device_token_path.display(),
-        user_token = %user_token_path.display(),
-        "Loading tokens"
-    );
-
-    let mut config = ClientConfig::from_files(&device_token_path, &user_token_path)?;
-    config = config.with_display(!cli.headless);
-
-    if cli.gif {
-        config = config.with_gif(cli.gif_delay);
+async fn run_cloud_web_server(
+    port: u16,
+    broker: String,
+    broker_port: u16,
+    user_token: Option<PathBuf>,
+    user_id: String,
+    ice: Vec<String>,
+) -> Result<()> {
+    let Some(path) = user_token else {
+        error!("Cloud mode requires --user-token <file> (a user token issued by your remarkable-server)");
+        std::process::exit(1);
+    };
+    let user_token = std::fs::read_to_string(&path)?.trim().to_string();
+    if user_token.is_empty() {
+        error!("User token file {:?} is empty", path);
+        std::process::exit(1);
     }
+    info!("Cloud mode: broker {}:{}, user id {}", broker, broker_port, user_id);
 
-    if cli.snapshots {
-        config = config.with_snapshots(cli.snapshot_interval);
-    }
+    let viewer_config = ViewerConfig::cloud(CloudConfig {
+        host: broker,
+        port: broker_port,
+        user_token,
+        user_id,
+        ice_servers: ice,
+        timeout: Duration::from_secs(30),
+    });
 
-    config = config.with_output(&cli.output);
+    let server_config = ServerConfig {
+        port,
+        ..Default::default()
+    };
+    WebServer::new(server_config, viewer_config).run().await
+}
 
-    // Create output directory
-    std::fs::create_dir_all(&cli.output)?;
-
-    let mut client = ScreenShareClient::new(config);
-
-    info!("Starting screen share client...");
-    client.run().await?;
-
+async fn capture_frame(output: &PathBuf, host: &str) -> Result<()> {
+    info!("Capturing frame from {}...", host);
+    
+    let config = UsbConfig {
+        host: host.to_string(),
+        ..Default::default()
+    };
+    
+    let capture = UsbCapture::with_config(config);
+    let frame = capture.capture_frame().await?;
+    
+    frame.save_png(output)?;
+    info!("Frame saved to {:?} ({}x{})", output, frame.width, frame.height);
+    
     Ok(())
 }
 
-fn resolve_token_paths(
-    cli: &Cli,
-    cloud_args: Option<&CloudArgs>,
-) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
-    let cloud_device = cloud_args.and_then(|a| a.device_token.clone());
-    let cloud_user = cloud_args.and_then(|a| a.user_token.clone());
-
-    let device_token_path = cloud_device
-        .or_else(|| cli.device_token.clone())
-        .or_else(|| {
-            cli.tokens_dir
-                .as_ref()
-                .map(|d| d.join("device_token_actual.txt"))
-        })
-        .ok_or("Missing device token path. Use --device-token or --tokens-dir")?;
-
-    let user_token_path = cloud_user
-        .or_else(|| cli.user_token.clone())
-        .or_else(|| {
-            cli.tokens_dir
-                .as_ref()
-                .map(|d| d.join("user_token_actual.txt"))
-        })
-        .ok_or("Missing user token path. Use --user-token or --tokens-dir")?;
-
-    if !device_token_path.exists() {
-        return Err(format!("Device token file not found: {}", device_token_path.display()).into());
+async fn record_session(
+    output: &PathBuf,
+    fps: u32,
+    duration: u64,
+    host: &str,
+    format: &str,
+) -> Result<()> {
+    info!("Starting recording to {:?}...", output);
+    
+    let recording_format = match format {
+        "jpg" | "jpeg" => RecordingFormat::JpegSequence,
+        _ => RecordingFormat::PngSequence,
+    };
+    
+    let recording_config = RecordingConfig {
+        format: recording_format,
+        output_path: output.clone(),
+        fps,
+        ..Default::default()
+    };
+    
+    let recorder = Recorder::new(recording_config);
+    let tx = recorder.start().await?;
+    
+    let usb_config = UsbConfig {
+        host: host.to_string(),
+        ..Default::default()
+    };
+    
+    let capture = UsbCapture::with_config(usb_config);
+    let mut frame_rx = capture.start_continuous(fps).await?;
+    
+    info!("Recording... Press Ctrl+C to stop");
+    
+    let start = std::time::Instant::now();
+    
+    tokio::select! {
+        _ = async {
+            while let Some(frame) = frame_rx.recv().await {
+                if tx.send(frame).await.is_err() {
+                    break;
+                }
+                if duration > 0 && start.elapsed().as_secs() >= duration {
+                    break;
+                }
+            }
+        } => {}
+        _ = tokio::signal::ctrl_c() => {
+            info!("Stopping recording...");
+        }
     }
+    
+    let stats = recorder.stop().await?;
+    info!(
+        "Recorded {} frames in {:.1}s to {:?}",
+        stats.frame_count,
+        stats.duration.as_secs_f64(),
+        stats.output_path
+    );
+    
+    Ok(())
+}
 
-    if !user_token_path.exists() {
-        return Err(format!("User token file not found: {}", user_token_path.display()).into());
+async fn test_connection(host: &str) -> Result<()> {
+    info!("Testing connection to {}...", host);
+    
+    let config = UsbConfig {
+        host: host.to_string(),
+        ..Default::default()
+    };
+    
+    let capture = UsbCapture::with_config(config);
+    
+    if capture.test_connection().await? {
+        info!("✓ Connection successful");
+        Ok(())
+    } else {
+        error!("✗ Connection failed");
+        std::process::exit(1);
     }
+}
 
-    Ok((device_token_path, user_token_path))
+async fn show_device_info(host: &str) -> Result<()> {
+    let config = UsbConfig {
+        host: host.to_string(),
+        ..Default::default()
+    };
+    
+    let capture = UsbCapture::with_config(config);
+    let info = capture.get_device_info().await?;
+    
+    println!("Device Information:");
+    println!("  Model:            {}", info.model);
+    println!("  Firmware Version: {}", info.firmware_version);
+    println!("  Display:          {}x{} @ {} bpp", info.width, info.height, info.depth);
+    
+    Ok(())
+}
+
+async fn encode_video(input: &str, output: &PathBuf, fps: u32, format: &str) -> Result<()> {
+    info!("Encoding video: {} -> {:?}", input, output);
+    
+    remarkable_screenshare::recorder::create_video_from_sequence(input, output, fps, format).await?;
+    
+    info!("Video created: {:?}", output);
+    Ok(())
 }

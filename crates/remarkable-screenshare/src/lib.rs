@@ -1,61 +1,59 @@
-//! reMarkable Screen Share Library
+#![forbid(unsafe_code)]
+//! reMarkable Screen Share Viewer
 //!
-//! A Rust implementation of the reMarkable screen share protocol.
+//! A comprehensive screen share solution for reMarkable tablets supporting:
+//! - WebRTC-based browser streaming (modern protocol)
+//! - USB framebuffer direct capture (offline, low-latency)
+//! - MQTT signaling integration
+//! - Recording capability (WebM/MP4)
 //!
-//! # Protocol Overview
+//! # Architecture
 //!
-//! 1. **MQTT Signaling**: Connect to VerneMQ broker with device tokens
-//! 2. **WebRTC Negotiation**: Exchange SDP offers/answers and ICE candidates
-//! 3. **RFB Data**: Receive framebuffer updates over WebRTC DataChannel
-//!
-//! # Features
-//!
-//! - **Cloud Screen Share**: MQTT + WebRTC + RFB protocol
-//! - **USB Capture**: Direct framebuffer capture via SSH
-//! - **Display**: Real-time window display with minifb
-//! - **Export**: PNG snapshots and GIF recording
-//! - **Input Injection**: Send keyboard and mouse events (optional)
-//!
-//! # Example
-//!
-//! ```ignore
-//! use remarkable_screenshare::{ClientConfig, ScreenShareClient};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = ClientConfig::from_files(
-//!         "device_token.txt",
-//!         "user_token.txt",
-//!     )?
-//!     .with_display(true)
-//!     .with_output("./frames");
-//!
-//!     let mut client = ScreenShareClient::new(config);
-//!     client.run().await?;
-//!
-//!     Ok(())
-//! }
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    remarkable-screenshare                        │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐           │
+//! │  │  WebRTC     │   │   MQTT      │   │    USB      │           │
+//! │  │  Viewer     │   │  Signaling  │   │  Capture    │           │
+//! │  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘           │
+//! │         │                 │                 │                   │
+//! │  ┌──────┴─────────────────┴─────────────────┴──────┐           │
+//! │  │              Frame Processor                     │           │
+//! │  │  (RFB decode, grayscale conversion, resize)      │           │
+//! │  └──────────────────────┬───────────────────────────┘           │
+//! │                         │                                       │
+//! │  ┌──────────────────────┴───────────────────────────┐           │
+//! │  │              Output Layer                         │           │
+//! │  │  - Browser (WebSocket → HTML5 Canvas)             │           │
+//! │  │  - Recording (GStreamer → WebM/MP4)               │           │
+//! │  │  - Frame export (PNG sequence)                    │           │
+//! │  └───────────────────────────────────────────────────┘           │
+//! └─────────────────────────────────────────────────────────────────┘
 //! ```
 
-pub mod client;
-pub mod display;
-pub mod export;
+pub mod constants;
+pub mod error;
+pub mod mqtt;
 pub mod rfb;
-pub mod signaling;
 pub mod usb;
 pub mod webrtc;
+pub mod cloud;
+pub mod viewer;
+pub mod recorder;
+pub mod server;
+pub mod token;
 
-// Re-exports
-pub use client::{ClientConfig, ClientError, ClientState, ScreenShareClient};
-pub use display::{Display, DisplayError, InputEvent};
-pub use export::{ExportError, GifRecorder, PngExporter};
-pub use rfb::{
-    Encoding, FramebufferUpdate, PixelFormat, Rectangle, RfbDecoder, RfbEncoder, RfbError,
-    FB_BPP, FB_HEIGHT, FB_WIDTH,
-};
-pub use signaling::{
-    MqttSignaling, SignalingConfig, SignalingError, SignalingEvent, SignalingMessage,
-    SignalingState,
-};
-pub use usb::{FramebufferInfo, UsbCapture, UsbConfig, UsbError};
-pub use webrtc::{ConnectionState, IceCandidate, WebRtcError, WebRtcEvent, WebRtcHandler};
+pub use error::{Error, Result};
+pub use constants::*;
+
+/// Re-export common types
+pub mod prelude {
+    pub use crate::constants::*;
+    pub use crate::error::{Error, Result};
+    pub use crate::mqtt::MqttSignaling;
+    pub use crate::rfb::RfbDecoder;
+    pub use crate::usb::UsbCapture;
+    pub use crate::viewer::ScreenShareViewer;
+    pub use crate::server::WebServer;
+}
