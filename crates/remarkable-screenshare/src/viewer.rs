@@ -1,6 +1,7 @@
 //! Screen share viewer: frames from the tablet over the cloud broker, or from
 //! its framebuffer over USB.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, RwLock};
@@ -34,13 +35,24 @@ pub enum ViewerState {
 pub struct ScreenShareViewer {
     source: ViewerSource,
     state: Arc<RwLock<ViewerState>>,
+    /// Bumped by every start, so a superseded background task can't
+    /// overwrite the state of a newer one.
+    generation: Arc<AtomicU64>,
     frame_tx: broadcast::Sender<Frame>,
+}
+
+/// Set `state` only while `gen` is still the current generation.
+async fn set_state(state: &RwLock<ViewerState>, generation: &AtomicU64, gen: u64, value: ViewerState) {
+    let mut guard = state.write().await;
+    if generation.load(Ordering::SeqCst) == gen {
+        *guard = value;
+    }
 }
 
 impl ScreenShareViewer {
     pub fn new(source: ViewerSource) -> Self {
         let (frame_tx, _) = broadcast::channel(4);
-        Self { source, state: Arc::new(RwLock::new(ViewerState::Disconnected)), frame_tx }
+        Self { source, state: Arc::new(RwLock::new(ViewerState::Disconnected)), generation: Arc::default(), frame_tx }
     }
 
     pub async fn state(&self) -> ViewerState {
@@ -61,6 +73,7 @@ impl ScreenShareViewer {
     }
 
     async fn start_cloud(&self, cfg: CloudConfig) -> Result<()> {
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         *self.state.write().await = ViewerState::Connecting;
         let session = match crate::cloud::connect(cfg).await {
             Ok(s) => s,
@@ -75,11 +88,12 @@ impl ScreenShareViewer {
         *self.state.write().await = ViewerState::Connected;
         let frame_tx = self.frame_tx.clone();
         let state = self.state.clone();
+        let generation = self.generation.clone();
         tokio::spawn(async move {
             // Own the session here so the peer connection and signaling task live
             // exactly as long as frames are flowing.
             let crate::cloud::CloudSession { webrtc, mut data_rx, signaling_task } = session;
-            *state.write().await = ViewerState::Streaming;
+            set_state(&state, &generation, gen, ViewerState::Streaming).await;
             if let Err(e) = pump_frames(&mut data_rx, |frame| {
                 let _ = frame_tx.send(frame);
             })
@@ -89,12 +103,13 @@ impl ScreenShareViewer {
             }
             signaling_task.abort();
             let _ = webrtc.close().await;
-            *state.write().await = ViewerState::Disconnected;
+            set_state(&state, &generation, gen, ViewerState::Disconnected).await;
         });
         Ok(())
     }
 
     async fn start_usb(&self, usb_config: UsbConfig) -> Result<()> {
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         *self.state.write().await = ViewerState::Connecting;
         info!("Starting USB viewer...");
 
@@ -109,12 +124,13 @@ impl ScreenShareViewer {
         *self.state.write().await = ViewerState::Connected;
         let frame_tx = self.frame_tx.clone();
         let state = self.state.clone();
+        let generation = self.generation.clone();
         tokio::spawn(async move {
-            *state.write().await = ViewerState::Streaming;
+            set_state(&state, &generation, gen, ViewerState::Streaming).await;
             while let Some(frame) = frame_rx.recv().await {
                 let _ = frame_tx.send(frame);
             }
-            *state.write().await = ViewerState::Disconnected;
+            set_state(&state, &generation, gen, ViewerState::Disconnected).await;
         });
         Ok(())
     }
