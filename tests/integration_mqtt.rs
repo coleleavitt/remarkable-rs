@@ -62,7 +62,7 @@ fn test_mqtt_topic_structure() {
     // Screen share signaling topic
     let screen_topic = Topic::screen_share_signaling(user_id, "client-1");
     assert!(screen_topic.as_str().starts_with("remarkable/screenshare/signaling/user/"));
-    assert!(screen_topic.as_str().ends_with("/client/client-1/signaling"));
+    assert!(screen_topic.as_str().ends_with("/client/client-1"));
 }
 
 /// Test sync complete event parsing

@@ -371,7 +371,7 @@ async fn cmd_info() -> Result<(), Box<dyn std::error::Error>> {
     println!("  user/{}/client/{}/notifications", config.user_id, config.client_id);
     println!("  user/{}/client/{}/sync", config.user_id, config.client_id);
     println!(
-        "  remarkable/screenshare/signaling/user/{}/client/{}/signaling (screen share, publish)",
+        "  remarkable/screenshare/signaling/user/{}/client/{} (screen share, publish)",
         config.user_id, config.client_id
     );
 

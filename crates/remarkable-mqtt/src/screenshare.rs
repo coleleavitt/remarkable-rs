@@ -5,7 +5,10 @@
 //! against a tablet and matching xochitl's `screenshare::Broker`:
 //!
 //! 1. Connect with `client_id = username = <cid>` and the user token as password,
-//!    then subscribe to [`subscription`] (`user/{uid}/#`).
+//!    then subscribe to both [`subscriptions`].
+//!
+//! Topics are the ones xochitl's `mqttbroker.cpp` builds (checked in 3.27.1.0:
+//! `getUserTopicPath`, `getClientTopicPath`, `getDirectTopicPath`).
 //! 2. Publish every request to [`signaling_topic`]:
 //!    - [`SignalingRequest::JoinActiveRoom`] → [`SignalingEvent::RoomJoined`] or
 //!      [`SignalingEvent::RoomNotFound`] (screen share is off on the tablet)
@@ -23,18 +26,24 @@ use serde_json::Value;
 
 use crate::MqttError;
 
-/// Topic a client publishes its signaling requests to.
+/// Topic a client publishes its signaling requests to:
+/// `remarkable/screenshare/signaling/user/{uid}/client/{cid}`.
 pub fn signaling_topic(user_id: &str, client_id: &str) -> String {
-    format!("remarkable/screenshare/signaling/user/{user_id}/client/{client_id}/signaling")
+    format!("remarkable/screenshare/signaling/user/{user_id}/client/{client_id}")
 }
 
-/// Subscription that receives every broker reply for `user_id`.
+/// The two filters xochitl subscribes to on connect.
 ///
-/// Replies arrive on `user/{uid}/signaling`, `user/{uid}/client/{cid}/signaling/{room}`
-/// and `user/{uid}/client/{cid}/signaling/room/{room}`; the message body says
-/// what it is, so clients subscribe to the whole user tree.
-pub fn subscription(user_id: &str) -> String {
-    format!("user/{user_id}/#")
+/// `user/{uid}/signaling` carries `room-created`; everything addressed to this
+/// client (`room-joined`, `room-not-found`, relayed `broadcast`/`direct`) arrives
+/// under `user/{uid}/client/{cid}/signaling/...`. Subscribing to all of
+/// `user/{uid}/#` instead would also deliver messages meant for the user's other
+/// clients, such as the copy of our own broadcast sent to the tablet.
+pub fn subscriptions(user_id: &str, client_id: &str) -> [String; 2] {
+    [
+        format!("user/{user_id}/signaling"),
+        format!("user/{user_id}/client/{client_id}/signaling/#"),
+    ]
 }
 
 /// Request a client publishes to [`signaling_topic`].
@@ -150,9 +159,12 @@ mod tests {
     fn topics() {
         assert_eq!(
             signaling_topic("local-user", "viewer-1"),
-            "remarkable/screenshare/signaling/user/local-user/client/viewer-1/signaling"
+            "remarkable/screenshare/signaling/user/local-user/client/viewer-1"
         );
-        assert_eq!(subscription("local-user"), "user/local-user/#");
+        assert_eq!(
+            subscriptions("local-user", "viewer-1"),
+            ["user/local-user/signaling", "user/local-user/client/viewer-1/signaling/#"]
+        );
     }
 
     #[test]

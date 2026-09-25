@@ -10,7 +10,7 @@
 //!     ├── sync                          # Client-specific sync
 //!     └── signaling/...                 # Screen share broker replies
 //!
-//! remarkable/screenshare/signaling/user/{user_id}/client/{client_id}/signaling
+//! remarkable/screenshare/signaling/user/{user_id}/client/{client_id}
 //!                                       # Screen share requests (publish)
 //! ```
 //!
@@ -35,7 +35,7 @@ pub enum Topic {
     ClientSync { user_id: String, client_id: String },
 
     /// Screen share signaling requests:
-    /// `remarkable/screenshare/signaling/user/{user_id}/client/{client_id}/signaling`
+    /// `remarkable/screenshare/signaling/user/{user_id}/client/{client_id}`
     ScreenShareSignaling { user_id: String, client_id: String },
 
     /// Wildcard subscription for all client topics
@@ -123,7 +123,7 @@ impl Topic {
                 user_id: (*user_id).to_string(),
                 client_id: (*client_id).to_string(),
             }),
-            ["remarkable", "screenshare", "signaling", "user", user_id, "client", client_id, "signaling"] => {
+            ["remarkable", "screenshare", "signaling", "user", user_id, "client", client_id] => {
                 Some(Self::ScreenShareSignaling {
                     user_id: (*user_id).to_string(),
                     client_id: (*client_id).to_string(),
@@ -183,7 +183,7 @@ mod tests {
         let topic = Topic::screen_share_signaling("abc", "xyz");
         assert_eq!(
             topic.as_str(),
-            "remarkable/screenshare/signaling/user/abc/client/xyz/signaling"
+            "remarkable/screenshare/signaling/user/abc/client/xyz"
         );
         assert_eq!(Topic::parse(&topic.as_str()), Some(topic));
     }
