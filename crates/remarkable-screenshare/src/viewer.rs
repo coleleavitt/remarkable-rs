@@ -11,6 +11,7 @@ use crate::cloud::CloudConfig;
 use crate::error::{Error, Result};
 use crate::session::{pump_frames, Frame, Update};
 use crate::usb::{UsbCapture, UsbConfig};
+use crate::webrtc::WebRtcHandler;
 
 /// Where frames come from.
 #[derive(Debug, Clone)]
@@ -50,6 +51,53 @@ async fn set_state(state: &RwLock<ViewerState>, generation: &AtomicU64, gen: u64
     let mut guard = state.write().await;
     if generation.load(Ordering::SeqCst) == gen {
         *guard = value;
+    }
+}
+
+/// Tears a cloud session down exactly once: aborts its MQTT signaling task and
+/// closes its peer connection.
+///
+/// The normal path calls [`close`](Self::close) to await teardown. If the
+/// producer task is aborted mid-stream instead (a newer `start` superseding it),
+/// `Drop` still runs: it aborts the signaling task and spawns `webrtc.close()`
+/// detached (a `Drop` can't await). Without this, an aborted producer never
+/// reaches its cleanup and both the signaling task and the peer connection leak
+/// on every replacement.
+struct CloudCleanup {
+    webrtc: Arc<WebRtcHandler>,
+    signaling_task: Option<tokio::task::JoinHandle<()>>,
+    done: bool,
+}
+
+impl CloudCleanup {
+    fn new(webrtc: Arc<WebRtcHandler>, signaling_task: tokio::task::JoinHandle<()>) -> Self {
+        Self { webrtc, signaling_task: Some(signaling_task), done: false }
+    }
+
+    /// Await teardown on the normal path.
+    async fn close(mut self) {
+        if let Some(task) = self.signaling_task.take() {
+            task.abort();
+        }
+        let _ = self.webrtc.close().await;
+        self.done = true;
+    }
+}
+
+impl Drop for CloudCleanup {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if let Some(task) = self.signaling_task.take() {
+            task.abort();
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let webrtc = self.webrtc.clone();
+            handle.spawn(async move {
+                let _ = webrtc.close().await;
+            });
+        }
     }
 }
 
@@ -108,16 +156,29 @@ impl ScreenShareViewer {
             }
         };
 
+        // A newer start superseded us while we were connecting: installing this
+        // session would abort that newer producer, so tear this one down instead
+        // (and do it properly, not by leaking it into a never-polled task).
+        if self.generation.load(Ordering::SeqCst) != gen {
+            let crate::cloud::CloudSession { webrtc, signaling_task, .. } = session;
+            CloudCleanup::new(webrtc, signaling_task).close().await;
+            return Ok(());
+        }
+
         // Before spawning, so the task's Streaming state can't be overwritten.
         *self.state.write().await = ViewerState::Connected;
+        // A fresh session starts with no cursor, clearing any stale one.
+        self.cursor_tx.send_replace(None);
         let frame_tx = self.frame_tx.clone();
         let cursor_tx = self.cursor_tx.clone();
         let state = self.state.clone();
         let generation = self.generation.clone();
         self.replace_task(async move {
             // Own the session here so the peer connection and signaling task live
-            // exactly as long as frames are flowing.
+            // exactly as long as frames are flowing; `cleanup` tears them down on
+            // both the normal exit and an abort (see `CloudCleanup`).
             let crate::cloud::CloudSession { webrtc, mut data_rx, signaling_task } = session;
+            let cleanup = CloudCleanup::new(webrtc, signaling_task);
             set_state(&state, &generation, gen, ViewerState::Streaming).await;
             if let Err(e) = pump_frames(&mut data_rx, |update| match update {
                 Update::Frame(frame) => {
@@ -132,8 +193,10 @@ impl ScreenShareViewer {
             {
                 error!("Screen share stream ended: {}", e);
             }
-            signaling_task.abort();
-            let _ = webrtc.close().await;
+            cleanup.close().await;
+            // The stream is over: drop any cursor so it can't linger over a
+            // later frame.
+            cursor_tx.send_replace(None);
             set_state(&state, &generation, gen, ViewerState::Disconnected).await;
         });
         Ok(())
@@ -172,13 +235,16 @@ impl ScreenShareViewer {
         }
         let info = capture.get_device_info().await?;
         info!("Connected to {} running firmware {}", info.model, info.firmware_version);
+        // Capture at the framebuffer's real geometry and depth: a Paper Pro is
+        // 16-bit RGB565, not 8-bit gray.
+        let capture = UsbCapture::with_config(capture.config().clone().with_device(&info));
         capture.start_continuous(10).await
     }
 
     /// Get a single frame
     pub async fn get_frame(&self) -> Result<Frame> {
         match &self.source {
-            ViewerSource::Usb(cfg) => UsbCapture::with_config(cfg.clone()).capture_frame().await,
+            ViewerSource::Usb(cfg) => UsbCapture::with_config(cfg.clone()).detected().await?.capture_frame().await,
             ViewerSource::Cloud(_) => self
                 .subscribe()
                 .recv()

@@ -67,6 +67,11 @@ pub async fn pump_frames(
     mut on_update: impl FnMut(Update),
 ) -> Result<()> {
     let mut decoder = RfbDecoder::new();
+    // A handshake or rotation makes the next delivered frame a full repaint.
+    // This persists across data-channel messages: the handshake and the first
+    // framebuffer update can arrive in separate messages, and that first frame
+    // must still replace the whole picture, not just its dirty rect.
+    let mut full_redraw_pending = false;
     loop {
         // The tablet pings every second or so; silence means it is gone.
         let data = match tokio::time::timeout(PING_TIMEOUT, data_rx.recv()).await {
@@ -75,16 +80,15 @@ pub async fn pump_frames(
             Err(_) => return Err(Error::Timeout(format!("no data from tablet for {PING_TIMEOUT:?}"))),
         };
         let mut changed = false;
-        // Union of this message's updates; `None` with `changed` means everything.
+        // Union of this message's updated rects.
         let mut dirty: Option<crate::rfb::Rect> = None;
-        let mut everything = false;
         let mut stopped = false;
         for event in decoder.feed(&data)? {
             match event {
                 Event::Handshake { version, width, height } => {
                     info!("Screen share handshake: server v{version} {width}x{height}");
                     // A new framebuffer: the next frame replaces the whole picture.
-                    everything = true;
+                    full_redraw_pending = true;
                     on_update(Update::Connected { width, height });
                 }
                 Event::FramebufferUpdated { dirty: rect, rects } => {
@@ -98,7 +102,7 @@ pub async fn pump_frames(
                 Event::Rotation(degrees) => {
                     info!("Tablet rotation: {degrees}°");
                     changed = decoder.is_ready();
-                    everything = true;
+                    full_redraw_pending = true;
                 }
                 Event::Cursor { x, y } => on_update(Update::Cursor(decoder.display_point(x, y))),
                 Event::Ping => debug!("Ping"),
@@ -112,12 +116,15 @@ pub async fn pump_frames(
         }
         if changed {
             let (data, width, height, format) = decoder.frame();
-            let changed = match dirty {
-                Some(rect) if !everything => {
-                    let (x, y, width, height) = decoder.display_rect(rect);
-                    Area { x, y, width, height }
-                }
-                _ => Area { x: 0, y: 0, width, height },
+            let changed = if full_redraw_pending {
+                // First frame after a handshake/rotation: the whole picture is new.
+                full_redraw_pending = false;
+                Area { x: 0, y: 0, width, height }
+            } else if let Some(rect) = dirty {
+                let (x, y, width, height) = decoder.display_rect(rect);
+                Area { x, y, width, height }
+            } else {
+                Area { x: 0, y: 0, width, height }
             };
             on_update(Update::Frame(Frame { data, width, height, format, changed, timestamp: Instant::now() }));
         }
@@ -192,6 +199,24 @@ mod tests {
         assert_eq!(areas, vec![
             Area { x: 0, y: 0, width: 4, height: 2 },
             Area { x: 1, y: 1, width: 2, height: 1 },
+        ]);
+    }
+
+    #[tokio::test]
+    async fn first_frame_after_handshake_is_full_screen() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Handshake and the first update arrive as separate messages, and that
+        // first update touches only a corner.
+        tx.send(handshake(4, 2)).unwrap();
+        tx.send(update(&[(Rect { x: 1, y: 1, width: 2, height: 1 }, 0)])).unwrap();
+        tx.send(update(&[(Rect { x: 0, y: 0, width: 1, height: 1 }, 0xffff)])).unwrap();
+        tx.send(vec![0x65]).unwrap();
+        let mut areas = Vec::new();
+        pump_frames(&mut rx, |u| if let Update::Frame(f) = u { areas.push(f.changed) }).await.unwrap();
+        assert_eq!(areas, vec![
+            // Full screen, even though only (1,1,2,1) changed in that message.
+            Area { x: 0, y: 0, width: 4, height: 2 },
+            Area { x: 0, y: 0, width: 1, height: 1 },
         ]);
     }
 

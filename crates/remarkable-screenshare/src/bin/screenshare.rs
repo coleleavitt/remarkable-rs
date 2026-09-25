@@ -226,9 +226,9 @@ async fn capture_frame(output: &PathBuf, host: &str) -> Result<()> {
         ..Default::default()
     };
     
-    let capture = UsbCapture::with_config(config);
+    let capture = UsbCapture::with_config(config).detected().await?;
     let frame = capture.capture_frame().await?;
-    
+
     frame.save_png(output)?;
     info!("Frame saved to {:?} ({}x{})", output, frame.width, frame.height);
     
@@ -264,7 +264,7 @@ async fn record_session(
         ..Default::default()
     };
     
-    let capture = UsbCapture::with_config(usb_config);
+    let capture = UsbCapture::with_config(usb_config).detected().await?;
     let mut frame_rx = capture.start_continuous(fps).await?;
     
     info!("Recording... Press Ctrl+C to stop");

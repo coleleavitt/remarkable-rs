@@ -151,20 +151,32 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // moves as `{"cursor":[x,y]}` / `{"cursor":null}` text.
     let send_task = tokio::spawn(async move {
         loop {
-            let msg = tokio::select! {
+            tokio::select! {
+                // Bias toward frames so a pending picture is sent before the
+                // cursor update that belongs on top of it.
+                biased;
                 changed = latest.changed() => {
                     if changed.is_err() { break }
-                    let Some(png) = latest.borrow_and_update().clone() else { continue };
-                    Message::Binary(png.to_vec())
+                    // Bind the clone so the watch guard is dropped before the await.
+                    let png = latest.borrow_and_update().clone();
+                    if let Some(png) = png {
+                        if sender.send(Message::Binary(png.to_vec())).await.is_err() { break }
+                    }
                 }
                 changed = cursor.changed() => {
                     if changed.is_err() { break }
+                    // Flush a newer frame first, so the cursor lands on the frame
+                    // it was reported against, not the previous one.
+                    if latest.has_changed().unwrap_or(false) {
+                        let png = latest.borrow_and_update().clone();
+                        if let Some(png) = png {
+                            if sender.send(Message::Binary(png.to_vec())).await.is_err() { break }
+                        }
+                    }
                     let point = *cursor.borrow_and_update();
-                    Message::Text(serde_json::json!({ "cursor": point.map(|(x, y)| [x, y]) }).to_string())
+                    let msg = Message::Text(serde_json::json!({ "cursor": point.map(|(x, y)| [x, y]) }).to_string());
+                    if sender.send(msg).await.is_err() { break }
                 }
-            };
-            if sender.send(msg).await.is_err() {
-                break;
             }
         }
     });
