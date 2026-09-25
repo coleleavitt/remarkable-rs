@@ -1,17 +1,18 @@
 //! Recording Support
 //!
-//! Record screen share sessions to video files (WebM/MP4) or image sequences.
+//! Record screen share sessions as PNG or JPEG image sequences (see the
+//! `encode` command to turn one into a video).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use image::{GrayImage, ImageBuffer, RgbImage};
+use image::{GrayImage, ImageBuffer};
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
-use crate::usb::Frame;
+use crate::session::Frame;
 
 /// Recording format
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -20,12 +21,6 @@ pub enum RecordingFormat {
     PngSequence,
     /// JPEG image sequence
     JpegSequence,
-    /// WebM video (VP8/VP9)
-    #[cfg(feature = "recording")]
-    WebM,
-    /// MP4 video (H.264)
-    #[cfg(feature = "recording")]
-    Mp4,
 }
 
 /// Recording configuration
@@ -136,10 +131,6 @@ impl Recorder {
                         if let Err(e) = save_frame_jpeg(&frame, &path, config.quality) {
                             warn!("Failed to save frame: {}", e);
                         }
-                    }
-                    #[cfg(feature = "recording")]
-                    _ => {
-                        // Video formats handled by GStreamer
                     }
                 }
                 

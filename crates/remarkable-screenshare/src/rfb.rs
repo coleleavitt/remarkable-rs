@@ -335,11 +335,11 @@ fn rotate(src: &[u8], w: usize, (dw, dh): (usize, usize), map: impl Fn(usize, us
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod testdata {
     use super::*;
     use flate2::{Compress, Compression, FlushCompress};
 
-    fn handshake(w: u16, h: u16) -> Vec<u8> {
+    pub(crate) fn handshake(w: u16, h: u16) -> Vec<u8> {
         let mut m = vec![msg::HANDSHAKE];
         m.extend(2u16.to_be_bytes());
         m.extend(w.to_be_bytes());
@@ -348,7 +348,7 @@ mod tests {
     }
 
     /// Compress like the tablet: one stream, `Z_PARTIAL_FLUSH` at the end, never finished.
-    fn partial_flushed_zlib(raw: &[u8]) -> Vec<u8> {
+    pub(crate) fn partial_flushed_zlib(raw: &[u8]) -> Vec<u8> {
         let mut z = Compress::new(Compression::default(), true);
         let mut out = Vec::with_capacity(raw.len() + 1024);
         z.compress_vec(raw, &mut out, FlushCompress::None).unwrap();
@@ -363,7 +363,7 @@ mod tests {
         out
     }
 
-    fn update(rects: &[(Rect, u16)]) -> Vec<u8> {
+    pub(crate) fn update(rects: &[(Rect, u16)]) -> Vec<u8> {
         let mut raw = Vec::new();
         for (r, px) in rects {
             for v in [r.x, r.y, r.width, r.height] {
@@ -382,6 +382,12 @@ mod tests {
         m.extend(z);
         m
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testdata::{handshake, update};
+    use super::*;
 
     #[test]
     fn handshake_then_update_split_across_chunks() {

@@ -1,59 +1,47 @@
 #![forbid(unsafe_code)]
-//! reMarkable Screen Share Viewer
+//! reMarkable screen share: receive the tablet's screen over WebRTC.
 //!
-//! A comprehensive screen share solution for reMarkable tablets supporting:
-//! - WebRTC-based browser streaming (modern protocol)
-//! - USB framebuffer direct capture (offline, low-latency)
-//! - MQTT signaling integration
-//! - Recording capability (WebM/MP4)
+//! The tablet shares its screen as an RFB-like byte stream ([`rfb`]) on a
+//! WebRTC data channel ([`webrtc`]). [`session::pump_frames`] turns that
+//! channel into grayscale [`Frame`]s. Negotiating the connection needs a
+//! signaling broker; message types live in `remarkable_mqtt::screenshare`.
 //!
-//! # Architecture
+//! # Features
 //!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                    remarkable-screenshare                        │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐           │
-//! │  │  WebRTC     │   │   MQTT      │   │    USB      │           │
-//! │  │  Viewer     │   │  Signaling  │   │  Capture    │           │
-//! │  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘           │
-//! │         │                 │                 │                   │
-//! │  ┌──────┴─────────────────┴─────────────────┴──────┐           │
-//! │  │              Frame Processor                     │           │
-//! │  │  (RFB decode, grayscale conversion, resize)      │           │
-//! │  └──────────────────────┬───────────────────────────┘           │
-//! │                         │                                       │
-//! │  ┌──────────────────────┴───────────────────────────┐           │
-//! │  │              Output Layer                         │           │
-//! │  │  - Browser (WebSocket → HTML5 Canvas)             │           │
-//! │  │  - Recording (GStreamer → WebM/MP4)               │           │
-//! │  │  - Frame export (PNG sequence)                    │           │
-//! │  └───────────────────────────────────────────────────┘           │
-//! └─────────────────────────────────────────────────────────────────┘
+//! - default: the protocol, transport and frame session only. Embed these
+//!   when you already have a signaling path (e.g. inside remarkable-server).
+//! - `cloud`: [`cloud::connect`], a client that negotiates through a
+//!   remarkable-server MQTT broker.
+//! - `app`: the `screenshare` binary and its pieces: a browser viewer
+//!   (`server`), USB framebuffer capture (`usb`) and PNG/JPEG recording.
+//!
+//! # Example
+//!
+//! ```ignore
+//! let (webrtc, ice_rx, mut data_rx) = WebRtcHandler::new(TransportConfig::default()).await?;
+//! let answer = webrtc.accept_offer(&tablet_offer).await?;
+//! // ... signal `answer` and the candidates from `ice_rx` to the tablet ...
+//! pump_frames(&mut data_rx, |frame| show(frame)).await?;
 //! ```
 
-pub mod constants;
 pub mod error;
-pub mod mqtt;
 pub mod rfb;
-pub mod usb;
+pub mod session;
 pub mod webrtc;
+
+#[cfg(feature = "cloud")]
 pub mod cloud;
-pub mod viewer;
+
+#[cfg(feature = "app")]
 pub mod recorder;
+#[cfg(feature = "app")]
 pub mod server;
-pub mod token;
+#[cfg(feature = "app")]
+pub mod usb;
+#[cfg(feature = "app")]
+pub mod viewer;
 
 pub use error::{Error, Result};
-pub use constants::*;
-
-/// Re-export common types
-pub mod prelude {
-    pub use crate::constants::*;
-    pub use crate::error::{Error, Result};
-    pub use crate::mqtt::MqttSignaling;
-    pub use crate::rfb::RfbDecoder;
-    pub use crate::usb::UsbCapture;
-    pub use crate::viewer::ScreenShareViewer;
-    pub use crate::server::WebServer;
-}
+pub use rfb::RfbDecoder;
+pub use session::{pump_frames, Frame};
+pub use webrtc::{TransportConfig, WebRtcHandler};

@@ -4,77 +4,46 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "reMarkable screen share viewer - MQTT signaling + WebRTC DataChannel + RFB v2"
+description = "reMarkable screen share: RFB v2 protocol, WebRTC transport and frame session"
 keywords = ["remarkable", "screenshare", "webrtc", "rfb"]
 
 [[bin]]
 name = "screenshare"
 path = "src/bin/screenshare.rs"
+required-features = ["app"]
+
+[features]
+default = []
+# MQTT client that negotiates through a remarkable-server broker.
+cloud = ["dep:rumqttc", "dep:remarkable-mqtt", "dep:uuid"]
+# The `screenshare` binary: browser viewer, USB capture, recording.
+app = ["cloud", "dep:axum", "dep:tower-http", "dep:futures", "dep:image", "dep:serde_json", "dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
-# Screen share signaling message types
-remarkable-mqtt.workspace = true
-
-# Async runtime
 tokio.workspace = true
-futures.workspace = true
-async-trait = "0.1"
+tracing.workspace = true
+thiserror.workspace = true
+bytes = "1"
+flate2 = "1.1"
 
 # WebRTC. Fork adds SettingEngine::set_sctp_max_message_size_can_receive, which
 # the tablet's >64 KiB frames need; switch back to crates.io once
 # https://github.com/webrtc-rs/webrtc/pull/908 is released.
 webrtc = { git = "https://github.com/coleleavitt/webrtc", branch = "fix/datachannel-max-message-size" }
 
-# MQTT client
-rumqttc.workspace = true
+# cloud
+remarkable-mqtt = { workspace = true, optional = true }
+rumqttc = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
-# SSH for USB capture
-russh = "0.46"
-russh-keys = "0.46"
-
-# Image processing
-image = { version = "0.25", features = ["png", "jpeg", "gif", "bmp"] }
-
-# Video recording (WebM/MP4 via gstreamer)
-gstreamer = { version = "0.23", optional = true }
-gstreamer-app = { version = "0.23", optional = true }
-gstreamer-video = { version = "0.23", optional = true }
-
-# Web server for browser viewer
-axum = { version = "0.7", features = ["ws"] }
-axum-extra = { version = "0.9", features = ["typed-header"] }
-tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["fs", "cors"] }
-
-# Serialization
-serde.workspace = true
-serde_json.workspace = true
-base64.workspace = true
-
-# JWT decoding (for token parsing)
-jsonwebtoken = "9"
-
-# CLI
-clap.workspace = true
-
-# Logging
-tracing.workspace = true
-tracing-subscriber.workspace = true
-
-# Error handling
-thiserror.workspace = true
-anyhow = "1"
-
-# Utilities
-bytes = "1"
-uuid.workspace = true
-chrono.workspace = true
-url = "2"
-flate2 = "1.1"
+# app
+axum = { version = "0.7", features = ["ws"], optional = true }
+tower-http = { version = "0.5", features = ["cors"], optional = true }
+futures = { workspace = true, optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+serde_json = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
-
-[features]
-default = []
-recording = ["gstreamer", "gstreamer-app", "gstreamer-video"]
+tokio = { workspace = true, features = ["test-util"] }

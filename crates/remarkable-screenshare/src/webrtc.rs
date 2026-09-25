@@ -10,6 +10,7 @@ use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
@@ -20,7 +21,6 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
-use crate::constants::DEFAULT_STUN_SERVERS;
 use crate::error::{Error, Result};
 use crate::rfb::{CHANNEL_LABEL, CLIENT_HANDSHAKE};
 
@@ -64,10 +64,23 @@ pub struct WebRtcHandler {
     state: Arc<RwLock<ConnectionState>>,
 }
 
+/// How the local end of the peer connection is set up.
+#[derive(Debug, Clone, Default)]
+pub struct TransportConfig {
+    /// STUN/TURN server URLs. Empty means host candidates only, which is enough
+    /// when this end has a reachable address (same LAN, or a public server).
+    pub ice_servers: Vec<String>,
+    /// Restrict ICE to this UDP port range, e.g. to match a firewall rule.
+    pub udp_ports: Option<(u16, u16)>,
+}
+
 impl WebRtcHandler {
-    /// Create new WebRTC handler
+    /// Create the answering side of a screen share peer connection.
+    ///
+    /// Returns the handler, local ICE candidates to signal to the tablet, and
+    /// the raw bytes of the tablet's `screenshare` data channel.
     pub async fn new(
-        stun_servers: Option<Vec<String>>,
+        config: TransportConfig,
     ) -> Result<(Self, mpsc::Receiver<IceCandidate>, mpsc::UnboundedReceiver<Vec<u8>>)> {
         // Set up media engine (not used for data-only, but required)
         let mut media_engine = MediaEngine::default();
@@ -82,6 +95,11 @@ impl WebRtcHandler {
         // data-channel read buffer and the SCTP receive window (webrtc-rs#908).
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_sctp_max_message_size_can_receive(MAX_MESSAGE_SIZE);
+        if let Some((min, max)) = config.udp_ports {
+            let range = EphemeralUDP::new(min, max)
+                .map_err(|e| Error::WebRtc(format!("Invalid UDP port range {min}-{max}: {e}")))?;
+            setting_engine.set_udp_network(UDPNetwork::Ephemeral(range));
+        }
 
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
@@ -89,12 +107,8 @@ impl WebRtcHandler {
             .with_setting_engine(setting_engine)
             .build();
         
-        // Configure ICE servers
-        let servers = stun_servers.unwrap_or_else(|| {
-            DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect()
-        });
-        
-        let ice_servers: Vec<RTCIceServer> = servers
+        let ice_servers: Vec<RTCIceServer> = config
+            .ice_servers
             .iter()
             .map(|url| RTCIceServer {
                 urls: vec![url.clone()],
