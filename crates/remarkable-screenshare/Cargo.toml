@@ -12,6 +12,9 @@ name = "screenshare"
 path = "src/bin/screenshare.rs"
 
 [dependencies]
+# Screen share signaling message types
+remarkable-mqtt.workspace = true
+
 # Async runtime
 tokio.workspace = true
 futures.workspace = true

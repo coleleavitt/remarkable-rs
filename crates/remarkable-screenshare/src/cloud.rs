@@ -16,14 +16,15 @@
 //!        and our own candidates the same way.
 //! ("webtrc" is xochitl's own spelling.)
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use remarkable_mqtt::screenshare::{signaling_topic, subscription};
+use remarkable_mqtt::{PeerMessage, SignalingEvent, SignalingRequest, WebRtcMessage};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
-use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
-use std::sync::Arc;
 use crate::webrtc::WebRtcHandler;
 
 /// Settings for cloud (internet) screenshare.
@@ -55,11 +56,34 @@ fn sig_err(e: impl std::fmt::Display) -> Error {
     Error::MqttSignaling(e.to_string())
 }
 
+/// Publishes signaling requests for one viewer.
+#[derive(Clone)]
+struct Signaler {
+    client: AsyncClient,
+    topic: String,
+}
+
+impl Signaler {
+    async fn send(&self, request: &SignalingRequest) -> Result<()> {
+        let body = request.to_bytes().map_err(sig_err)?;
+        self.client.publish(&self.topic, QoS::AtLeastOnce, false, body).await.map_err(sig_err)
+    }
+
+    /// Send a WebRTC message straight to the tablet.
+    async fn to_tablet(&self, room_id: &str, tablet: &str, msg: WebRtcMessage) -> Result<()> {
+        self.send(&SignalingRequest::Direct {
+            room_id: room_id.to_owned(),
+            client_id: tablet.to_owned(),
+            payload: PeerMessage::WebRtc { payload: msg },
+        })
+        .await
+    }
+}
+
 /// Connect to the broker, join the active room, and complete WebRTC negotiation.
 pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
     let cid = format!("viewer-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let uid = cfg.user_id.clone();
-    let pub_topic = format!("remarkable/screenshare/signaling/user/{uid}/client/{cid}/signaling");
 
     let mut opts = MqttOptions::new(cid.clone(), cfg.host.clone(), cfg.port);
     opts.set_credentials(cid.clone(), cfg.user_token.clone());
@@ -69,17 +93,15 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
 
     info!("cloud: connecting to {}:{} as {}", cfg.host, cfg.port, cid);
     let (client, mut eventloop) = AsyncClient::new(opts, 64);
+    let signaler = Signaler { client: client.clone(), topic: signaling_topic(&uid, &cid) };
 
     // --- Phase 1: connect, join room, collect offer + early candidates ---
     let deadline = tokio::time::Instant::now() + cfg.timeout;
     let mut room_id: Option<String> = None;
     let mut tablet_cid: Option<String> = None;
-    let mut offer_sdp: Option<String> = None;
     let mut early_cands: Vec<(String, Option<String>)> = Vec::new();
 
-    let join = json!({"type":"join-active-room","room":"","roomId":""}).to_string();
-
-    while offer_sdp.is_none() {
+    let offer = loop {
         let ev = tokio::time::timeout_at(deadline, eventloop.poll())
             .await
             .map_err(|_| Error::Timeout(match &room_id {
@@ -91,49 +113,42 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
         match ev {
             Event::Incoming(Packet::ConnAck(ack)) => {
                 info!("cloud: connected ({:?})", ack.code);
-                client.subscribe(format!("user/{uid}/#"), QoS::AtLeastOnce).await.map_err(sig_err)?;
-                client.publish(&pub_topic, QoS::AtLeastOnce, false, join.clone()).await.map_err(sig_err)?;
+                client.subscribe(subscription(&uid), QoS::AtLeastOnce).await.map_err(sig_err)?;
+                signaler
+                    .send(&SignalingRequest::JoinActiveRoom { room: String::new(), room_id: String::new() })
+                    .await?;
             }
-            Event::Incoming(Packet::Publish(p)) => {
-                let Ok(j) = serde_json::from_slice::<Value>(&p.payload) else { continue };
-                match j["type"].as_str().unwrap_or("") {
-                    "room-not-found" => {
-                        return Err(Error::DeviceNotReady);
-                    }
-                    "room-joined" if room_id.is_none() => {
-                        let r = j["roomId"].as_str().unwrap_or_default().to_string();
-                        info!("cloud: joined room {r}; requesting offer");
-                        let req = json!({"type":"broadcast","roomId":r,
-                                         "payload":{"type":"request-offer","id":cid}}).to_string();
-                        client.publish(&pub_topic, QoS::AtLeastOnce, false, req).await.map_err(sig_err)?;
-                        room_id = Some(r);
-                    }
-                    "direct" => {
-                        if let Some(t) = j["clientId"].as_str() { tablet_cid.get_or_insert(t.to_string()); }
-                        let inner = &j["payload"]["payload"];
-                        match inner["type"].as_str().unwrap_or("") {
-                            "offer" => {
-                                offer_sdp = inner["description"].as_str().map(String::from);
-                                info!("cloud: got offer from tablet");
-                            }
-                            "candidate" => {
-                                if let Some(c) = inner["candidate"].as_str() {
-                                    early_cands.push((c.to_string(), inner["mid"].as_str().map(String::from)));
-                                }
-                            }
-                            other => debug!("cloud: ignoring direct inner type {other}"),
-                        }
-                    }
-                    other => debug!("cloud: ignoring {other} on {}", p.topic),
+            Event::Incoming(Packet::Publish(p)) => match SignalingEvent::from_bytes(&p.payload) {
+                Some(SignalingEvent::RoomNotFound) => return Err(Error::DeviceNotReady),
+                Some(SignalingEvent::RoomJoined { room_id: r, .. }) if room_id.is_none() => {
+                    info!("cloud: joined room {r}; requesting offer");
+                    signaler
+                        .send(&SignalingRequest::Broadcast {
+                            room_id: r.clone(),
+                            payload: PeerMessage::RequestOffer { id: cid.clone() },
+                        })
+                        .await?;
+                    room_id = Some(r);
                 }
-            }
+                Some(SignalingEvent::Direct { client_id, payload: PeerMessage::WebRtc { payload } }) => {
+                    tablet_cid.get_or_insert(client_id);
+                    match payload {
+                        WebRtcMessage::Offer { description } => {
+                            info!("cloud: got offer from tablet");
+                            break description;
+                        }
+                        WebRtcMessage::Candidate { candidate, mid } => early_cands.push((candidate, mid)),
+                        WebRtcMessage::Answer { .. } => debug!("cloud: ignoring answer"),
+                    }
+                }
+                other => debug!("cloud: ignoring {other:?} on {}", p.topic),
+            },
             _ => {}
         }
-    }
+    };
 
     let room_id = room_id.ok_or_else(|| sig_err("offer without room"))?;
     let tablet_cid = tablet_cid.ok_or_else(|| sig_err("offer without clientId"))?;
-    let offer = offer_sdp.unwrap();
 
     // --- Phase 2: WebRTC answer ---
     let stun = if cfg.ice_servers.is_empty() { Some(vec![]) } else { Some(cfg.ice_servers.clone()) };
@@ -141,11 +156,7 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
     let webrtc = Arc::new(webrtc);
     let answer = webrtc.accept_offer(&offer).await?;
 
-    let (room_id_w, tablet_cid_w) = (room_id.clone(), tablet_cid.clone());
-    let wrap = move |inner: Value| json!({"type":"direct","roomId":room_id_w,"clientId":tablet_cid_w,
-                                      "payload":{"type":"webtrc","payload":inner}}).to_string();
-    client.publish(&pub_topic, QoS::AtLeastOnce, false,
-                   wrap(json!({"type":"answer","description":answer}))).await.map_err(sig_err)?;
+    signaler.to_tablet(&room_id, &tablet_cid, WebRtcMessage::Answer { description: answer }).await?;
     info!("cloud: sent answer");
 
     for (c, mid) in early_cands.drain(..) {
@@ -156,28 +167,28 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
 
     // --- Phase 3: keep trickling ICE both ways in the background ---
     let wrtc_cands = Arc::clone(&webrtc);
-    let task_client = client.clone();
-    let task_topic = pub_topic.clone();
     let signaling_task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 ev = eventloop.poll() => match ev {
                     Ok(Event::Incoming(Packet::Publish(p))) => {
-                        let Ok(j) = serde_json::from_slice::<Value>(&p.payload) else { continue };
-                        let inner = &j["payload"]["payload"];
-                        if j["type"] == "direct" && inner["type"] == "candidate" {
-                            if let Some(c) = inner["candidate"].as_str() {
-                                let _ = wrtc_cands.add_ice_candidate(c, inner["mid"].as_str(), Some(0)).await;
-                            }
+                        if let Some(SignalingEvent::Direct {
+                            payload: PeerMessage::WebRtc { payload: WebRtcMessage::Candidate { candidate, mid } },
+                            ..
+                        }) = SignalingEvent::from_bytes(&p.payload)
+                        {
+                            let _ = wrtc_cands.add_ice_candidate(&candidate, mid.as_deref(), Some(0)).await;
                         }
                     }
                     Ok(_) => {}
                     Err(e) => { warn!("cloud: signaling connection ended: {e}"); break; }
                 },
                 Some(c) = ice_rx.recv() => {
-                    let msg = wrap(json!({"type":"candidate","candidate":c.candidate,
-                                          "mid":c.sdp_mid.unwrap_or_else(|| "0".into())}));
-                    let _ = task_client.publish(&task_topic, QoS::AtLeastOnce, false, msg).await;
+                    let msg = WebRtcMessage::Candidate {
+                        candidate: c.candidate,
+                        mid: Some(c.sdp_mid.unwrap_or_else(|| "0".into())),
+                    };
+                    let _ = signaler.to_tablet(&room_id, &tablet_cid, msg).await;
                 }
             }
         }

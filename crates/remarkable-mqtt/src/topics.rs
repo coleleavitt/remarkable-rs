@@ -8,7 +8,10 @@
 //! └── client/{client_id}/
 //!     ├── notifications                 # General notifications
 //!     ├── sync                          # Client-specific sync
-//!     └── screenshare                   # Screen share signaling
+//!     └── signaling/...                 # Screen share broker replies
+//!
+//! remarkable/screenshare/signaling/user/{user_id}/client/{client_id}/signaling
+//!                                       # Screen share requests (publish)
 //! ```
 //!
 //! # Message Flow
@@ -31,8 +34,9 @@ pub enum Topic {
     /// Client sync events: `user/{user_id}/client/{client_id}/sync`
     ClientSync { user_id: String, client_id: String },
 
-    /// Screen share signaling: `user/{user_id}/client/{client_id}/screenshare`
-    ScreenShare { user_id: String, client_id: String },
+    /// Screen share signaling requests:
+    /// `remarkable/screenshare/signaling/user/{user_id}/client/{client_id}/signaling`
+    ScreenShareSignaling { user_id: String, client_id: String },
 
     /// Wildcard subscription for all client topics
     AllClientTopics { user_id: String, client_id: String },
@@ -65,9 +69,9 @@ impl Topic {
         }
     }
 
-    /// Create screen share topic
-    pub fn screen_share(user_id: impl Into<String>, client_id: impl Into<String>) -> Self {
-        Self::ScreenShare {
+    /// Create the screen share signaling topic a client publishes requests to
+    pub fn screen_share_signaling(user_id: impl Into<String>, client_id: impl Into<String>) -> Self {
+        Self::ScreenShareSignaling {
             user_id: user_id.into(),
             client_id: client_id.into(),
         }
@@ -91,8 +95,8 @@ impl Topic {
             Self::ClientSync { user_id, client_id } => {
                 format!("user/{}/client/{}/sync", user_id, client_id)
             }
-            Self::ScreenShare { user_id, client_id } => {
-                format!("user/{}/client/{}/screenshare", user_id, client_id)
+            Self::ScreenShareSignaling { user_id, client_id } => {
+                crate::screenshare::signaling_topic(user_id, client_id)
             }
             Self::AllClientTopics { user_id, client_id } => {
                 format!("user/{}/client/{}/#", user_id, client_id)
@@ -119,10 +123,12 @@ impl Topic {
                 user_id: (*user_id).to_string(),
                 client_id: (*client_id).to_string(),
             }),
-            ["user", user_id, "client", client_id, "screenshare"] => Some(Self::ScreenShare {
-                user_id: (*user_id).to_string(),
-                client_id: (*client_id).to_string(),
-            }),
+            ["remarkable", "screenshare", "signaling", "user", user_id, "client", client_id, "signaling"] => {
+                Some(Self::ScreenShareSignaling {
+                    user_id: (*user_id).to_string(),
+                    client_id: (*client_id).to_string(),
+                })
+            }
             _ => Some(Self::Custom(topic.to_string())),
         }
     }
@@ -170,6 +176,16 @@ mod tests {
             Topic::ClientNotifications { user_id, client_id }
             if user_id == "abc" && client_id == "xyz"
         ));
+    }
+
+    #[test]
+    fn test_screen_share_signaling_topic_round_trips() {
+        let topic = Topic::screen_share_signaling("abc", "xyz");
+        assert_eq!(
+            topic.as_str(),
+            "remarkable/screenshare/signaling/user/abc/client/xyz/signaling"
+        );
+        assert_eq!(Topic::parse(&topic.as_str()), Some(topic));
     }
 
     #[test]

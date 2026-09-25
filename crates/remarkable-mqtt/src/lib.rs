@@ -17,7 +17,8 @@
 //! user/{user_id}/sync                              - User-wide sync events
 //! user/{user_id}/client/{client_id}/notifications  - General notifications
 //! user/{user_id}/client/{client_id}/sync           - Client-specific sync
-//! user/{user_id}/client/{client_id}/screenshare    - Screen share signaling
+//! remarkable/screenshare/signaling/user/{user_id}/client/{client_id}/signaling
+//!                                                  - Screen share signaling (publish)
 //! ```
 //!
 //! # Features
@@ -58,7 +59,7 @@ mod config;
 mod error;
 mod message;
 mod reconnect;
-mod screenshare;
+pub mod screenshare;
 pub mod ssh;
 pub mod sync_events;
 mod topics;
@@ -68,5 +69,5 @@ pub use config::{MqttConfig, DEFAULT_BROKER, DEFAULT_PORT};
 pub use error::MqttError;
 pub use message::{parse_mqtt_payload, MqttEvent, Notification, SyncComplete};
 pub use reconnect::{BackoffConfig, ConnectionState, EventHandler, ReconnectingClient};
-pub use screenshare::{ScreenShareClient, ScreenShareSession, ScreenShareSignal, SessionState};
+pub use screenshare::{PeerMessage, SignalingEvent, SignalingRequest, WebRtcMessage};
 pub use topics::{default_subscriptions, Topic};
