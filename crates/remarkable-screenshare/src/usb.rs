@@ -24,7 +24,11 @@ const FB_WIDTH: u32 = 1404;
 const FB_HEIGHT: u32 = 1872;
 
 /// USB capture configuration
+///
+/// `#[non_exhaustive]` so new fields (like `depth`) can be added without
+/// breaking downstream callers; construct it from [`UsbConfig::default`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UsbConfig {
     pub host: String,
     pub port: u16,
@@ -33,6 +37,8 @@ pub struct UsbConfig {
     pub key_path: Option<String>,
     pub width: u32,
     pub height: u32,
+    /// Bits per pixel: 8 = gray (reMarkable 1/2), 16 = RGB565 (Paper Pro).
+    pub depth: u32,
     pub fb_device: String,
 }
 
@@ -46,19 +52,57 @@ impl Default for UsbConfig {
             key_path: None,
             width: FB_WIDTH,
             height: FB_HEIGHT,
+            depth: 8,
             fb_device: FB_DEVICE_PATH.to_string(),
         }
     }
 }
 
+impl UsbConfig {
+    /// A default config targeting `host` (the way to build one now that the
+    /// struct is `#[non_exhaustive]`).
+    pub fn for_host(host: impl Into<String>) -> Self {
+        Self { host: host.into(), ..Self::default() }
+    }
+
+    /// This config updated from what the device actually reports.
+    ///
+    /// If detection failed, the caller's config is kept unchanged rather than
+    /// overwritten with fallback values. Otherwise it takes the detected `depth`
+    /// (the reason detection exists — a Paper Pro is 16-bit RGB565, not 8-bit
+    /// gray) and auto-fills geometry only when it is still the default, so
+    /// deliberately non-default dimensions (or a custom `fb_device`, which
+    /// `fbset -i` does not describe) are respected rather than clobbered.
+    pub(crate) fn with_device(self, info: &DeviceInfo) -> Self {
+        if !info.detected {
+            return self;
+        }
+        let default_geometry = self.width == FB_WIDTH && self.height == FB_HEIGHT;
+        Self {
+            depth: info.depth,
+            width: if default_geometry { info.width } else { self.width },
+            height: if default_geometry { info.height } else { self.height },
+            ..self
+        }
+    }
+}
+
 /// Device information
+///
+/// `#[non_exhaustive]`: this is an output struct (returned by
+/// [`UsbCapture::get_device_info`]); callers read it rather than build it, and
+/// new fields shouldn't break them.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DeviceInfo {
     pub model: String,
     pub firmware_version: String,
     pub width: u32,
     pub height: u32,
     pub depth: u32,
+    /// Whether `width`/`height`/`depth` came from the device (via `fbset`)
+    /// rather than the caller's fallback config.
+    pub detected: bool,
 }
 
 /// USB framebuffer capture
@@ -80,7 +124,20 @@ impl UsbCapture {
             running: Arc::new(Mutex::new(false)),
         }
     }
-    
+
+    /// The configuration this capture uses.
+    pub fn config(&self) -> &UsbConfig {
+        &self.config
+    }
+
+    /// Query the device and return a capture configured for its real
+    /// framebuffer geometry and pixel depth (so a Paper Pro is captured as
+    /// 16-bit RGB565, not truncated to 8-bit gray).
+    pub async fn detected(&self) -> Result<Self> {
+        let info = self.get_device_info().await?;
+        Ok(Self::with_config(self.config.clone().with_device(&info)))
+    }
+
     /// Test SSH connection
     pub async fn test_connection(&self) -> Result<bool> {
         let output = self.run_ssh_command("echo ok").await?;
@@ -93,35 +150,49 @@ impl UsbCapture {
         let version_output = self.run_ssh_command("cat /etc/version 2>/dev/null || echo unknown").await?;
         let firmware_version = version_output.trim().to_string();
         
-        // Get framebuffer info using fbset
-        let fbset_output = self.run_ssh_command("fbset -i 2>/dev/null || echo 'geometry 1872 1404 1872 1404 8'").await?;
-        let (width, height, depth) = parse_fbset_output(&fbset_output);
-        
+        // Get framebuffer info using fbset. If it gives us nothing, fall back to
+        // the caller's configured geometry (not a hardcoded guess) and flag that
+        // detection did not happen, so we don't mislabel the framebuffer.
+        let fbset_output = self.run_ssh_command("fbset -i 2>/dev/null || true").await?;
+        let (width, height, depth, detected) = match parse_fbset_output(&fbset_output) {
+            Some((w, h, d)) => (w, h, d, true),
+            None => (self.config.width, self.config.height, self.config.depth, false),
+        };
+
         // Detect model from dimensions
         let model = match (width, height) {
             (1404, 1872) | (1872, 1404) => "reMarkable 2",
             (2880, 2160) | (2160, 2880) => "reMarkable Paper Pro",
             _ => "Unknown",
         }.to_string();
-        
+
         Ok(DeviceInfo {
             model,
             firmware_version,
             width,
             height,
             depth,
+            detected,
         })
     }
     
     /// Capture single frame
     pub async fn capture_frame(&self) -> Result<Frame> {
         let start = std::time::Instant::now();
-        
+
         // Read framebuffer
         let raw_data = self.run_ssh_command_binary(&format!("cat {}", shell_quote(&self.config.fb_device))).await?;
-        
-        // Validate size
-        let expected_size = self.config.width as usize * self.config.height as usize;
+
+        // Validate size: honour the pixel depth (Paper Pro is 2 bytes/pixel).
+        // Only the two depths reMarkable devices use are supported; anything
+        // else is rejected rather than silently truncated or mislabelled.
+        let pixels = self.config.width as usize * self.config.height as usize;
+        let bytes_per_pixel = match self.config.depth {
+            8 => 1,
+            16 => 2,
+            other => return Err(Error::Framebuffer(format!("unsupported framebuffer depth {other} bpp"))),
+        };
+        let expected_size = pixels * bytes_per_pixel;
         if raw_data.len() < expected_size {
             return Err(Error::Framebuffer(format!(
                 "Incomplete framebuffer: {} < {}",
@@ -129,11 +200,12 @@ impl UsbCapture {
                 expected_size
             )));
         }
-        
+
+        let (data, format) = decode_framebuffer(&raw_data, pixels, self.config.depth);
         Ok(Frame {
-            format: crate::session::PixelFormat::Gray8,
+            format,
             changed: crate::session::Area { x: 0, y: 0, width: self.config.width, height: self.config.height },
-            data: raw_data[..expected_size].to_vec(),
+            data,
             width: self.config.width,
             height: self.config.height,
             timestamp: start,
@@ -231,24 +303,41 @@ impl Default for UsbCapture {
     }
 }
 
-/// Parse fbset output to get dimensions
-fn parse_fbset_output(output: &str) -> (u32, u32, u32) {
-    let mut width = FB_WIDTH;
-    let mut height = FB_HEIGHT;
-    let mut depth = 8;
-    
+/// Decode `pixels` framebuffer pixels into a display frame's bytes and format.
+///
+/// `depth` is one of the two the caller has already validated: 16 is
+/// little-endian RGB565 (the Paper Pro's colour screen), 8 is gray (reMarkable
+/// 1/2). The caller has also checked `raw` holds at least
+/// `pixels * bytes_per_pixel` bytes.
+fn decode_framebuffer(raw: &[u8], pixels: usize, depth: u32) -> (Vec<u8>, crate::session::PixelFormat) {
+    use crate::session::PixelFormat;
+    if depth == 16 {
+        let data = raw[..pixels * 2]
+            .chunks_exact(2)
+            .flat_map(|p| crate::rfb::rgb565_to_rgb(u16::from_le_bytes([p[0], p[1]])))
+            .collect();
+        (data, PixelFormat::Rgb8)
+    } else {
+        (raw[..pixels].to_vec(), PixelFormat::Gray8)
+    }
+}
+
+/// Parse fbset output for `(width, height, depth)`; `None` if it has no usable
+/// `geometry` line (so the caller can tell detection failed rather than silently
+/// using a guess).
+fn parse_fbset_output(output: &str) -> Option<(u32, u32, u32)> {
     for line in output.lines() {
         if line.contains("geometry") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 6 {
-                width = parts[1].parse().unwrap_or(width);
-                height = parts[2].parse().unwrap_or(height);
-                depth = parts[5].parse().unwrap_or(depth);
+                let width = parts[1].parse().ok()?;
+                let height = parts[2].parse().ok()?;
+                let depth = parts[5].parse().ok()?;
+                return Some((width, height, depth));
             }
         }
     }
-    
-    (width, height, depth)
+    None
 }
 
 /// Quote `s` as one word for a POSIX shell.
@@ -268,13 +357,61 @@ mod tests {
     }
 
     #[test]
+    fn decodes_rgb565_when_16_bit() {
+        // Pure red RGB565 (0xF800), little-endian bytes, one pixel.
+        let (data, format) = decode_framebuffer(&[0x00, 0xF8], 1, 16);
+        assert_eq!(format, crate::session::PixelFormat::Rgb8);
+        assert_eq!(data, vec![255, 0, 0]);
+    }
+
+    #[test]
+    fn decodes_gray_when_8_bit() {
+        let (data, format) = decode_framebuffer(&[0x12, 0x34], 2, 8);
+        assert_eq!(format, crate::session::PixelFormat::Gray8);
+        assert_eq!(data, vec![0x12, 0x34]);
+    }
+
+    #[test]
     fn test_parse_fbset() {
         let output = r#"mode "1872x1404"
     geometry 1872 1404 1872 1404 8
 "#;
-        let (w, h, d) = parse_fbset_output(output);
-        assert_eq!(w, 1872);
-        assert_eq!(h, 1404);
-        assert_eq!(d, 8);
+        assert_eq!(parse_fbset_output(output), Some((1872, 1404, 8)));
+    }
+
+    #[test]
+    fn parse_fbset_returns_none_without_geometry() {
+        assert_eq!(parse_fbset_output(""), None);
+        assert_eq!(parse_fbset_output("fbset: not found"), None);
+    }
+
+    #[test]
+    fn with_device_keeps_config_when_detection_failed() {
+        let cfg = UsbConfig { width: 100, height: 200, depth: 16, ..UsbConfig::default() };
+        let info = DeviceInfo {
+            model: "Unknown".into(),
+            firmware_version: "x".into(),
+            width: FB_WIDTH,
+            height: FB_HEIGHT,
+            depth: 8,
+            detected: false,
+        };
+        let out = cfg.clone().with_device(&info);
+        assert_eq!((out.width, out.height, out.depth), (100, 200, 16));
+    }
+
+    #[test]
+    fn with_device_applies_detected_values() {
+        let info = DeviceInfo {
+            model: "reMarkable Paper Pro".into(),
+            firmware_version: "x".into(),
+            width: 2160,
+            height: 2880,
+            depth: 16,
+            detected: true,
+        };
+        // A default-geometry config is corrected to the detected colour screen.
+        let out = UsbConfig::default().with_device(&info);
+        assert_eq!((out.width, out.height, out.depth), (2160, 2880, 16));
     }
 }

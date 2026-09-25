@@ -48,11 +48,12 @@ impl Default for ServerConfig {
 /// Shared server state
 struct AppState {
     viewer: Arc<ScreenShareViewer>,
-    /// Latest frame as PNG, so late joiners get a picture straight away
-    /// instead of waiting for the tablet screen to change.
-    latest_png: watch::Receiver<Option<Arc<Vec<u8>>>>,
-    /// Pen position, forwarded to browsers.
-    cursor: watch::Receiver<Option<(u32, u32)>>,
+    /// Latest frame as `(sequence, PNG)`, so late joiners get a picture straight
+    /// away instead of waiting for the tablet screen to change. The sequence
+    /// pairs each frame with the cursor reported against it.
+    latest_png: watch::Receiver<Option<(u64, Arc<Vec<u8>>)>>,
+    /// Pen position tagged with the frame sequence it belongs to.
+    cursor: watch::Receiver<(u64, Option<(u32, u32)>)>,
 }
 
 /// Web server
@@ -71,29 +72,44 @@ impl WebServer {
     pub async fn run(&self) -> Result<()> {
         let viewer = Arc::new(ScreenShareViewer::new(self.source.clone()));
         let (png_tx, latest_png) = watch::channel(None);
-        
+        // Each frame carries a sequence, and each cursor is tagged with the
+        // sequence of the frame it belongs to, so the browser can pair them
+        // exactly instead of relying on delivery timing over two channels.
+        let (cursor_tx, cursor_rx) = watch::channel((0u64, None));
+
         let state = Arc::new(AppState {
             viewer: viewer.clone(),
             latest_png,
-            cursor: viewer.cursor(),
+            cursor: cursor_rx,
         });
-        
+
         // Subscribe before starting so the first frame is not missed.
-        let mut rx = viewer.subscribe();
+        let mut frames = viewer.subscribe();
+        let mut cursor = viewer.cursor();
         viewer.start().await?;
-        
+
         tokio::spawn(async move {
+            // Frames encoded so far; also the sequence a cursor is tagged with.
+            let mut seq: u64 = 0;
             loop {
-                match rx.recv().await {
-                    Ok(frame) => match frame_to_png(&frame) {
-                        Ok(png) => {
-                            png_tx.send_replace(Some(Arc::new(png)));
-                        }
-                        Err(e) => warn!("Failed to encode frame: {}", e),
+                tokio::select! {
+                    frame = frames.recv() => match frame {
+                        Ok(frame) => match frame_to_png(&frame) {
+                            Ok(png) => {
+                                seq += 1;
+                                png_tx.send_replace(Some((seq, Arc::new(png))));
+                            }
+                            Err(e) => warn!("Failed to encode frame: {}", e),
+                        },
+                        // Only the newest frame matters; skip what we missed.
+                        Err(broadcast::error::RecvError::Lagged(n)) => debug!("Skipped {} frames", n),
+                        Err(broadcast::error::RecvError::Closed) => break,
                     },
-                    // Only the newest frame matters; skip what we missed.
-                    Err(broadcast::error::RecvError::Lagged(n)) => debug!("Skipped {} frames", n),
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    changed = cursor.changed() => {
+                        if changed.is_err() { break }
+                        // Tag the cursor with the frame it was reported against.
+                        cursor_tx.send_replace((seq, *cursor.borrow_and_update()));
+                    }
                 }
             }
         });
@@ -147,24 +163,31 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     
     info!("WebSocket client connected");
     
-    // Send the current frame, then each newer one (binary PNG), and pen
-    // moves as `{"cursor":[x,y]}` / `{"cursor":null}` text.
+    // Send the current frame, then each newer one as a binary message of an
+    // 8-byte big-endian sequence followed by the PNG, and pen moves as
+    // `{"cursor":[x,y],"seq":n}` / `{"cursor":null,"seq":n}` text. The browser
+    // pairs a cursor with its frame by sequence, so send order doesn't matter.
     let send_task = tokio::spawn(async move {
         loop {
-            let msg = tokio::select! {
+            tokio::select! {
                 changed = latest.changed() => {
                     if changed.is_err() { break }
-                    let Some(png) = latest.borrow_and_update().clone() else { continue };
-                    Message::Binary(png.to_vec())
+                    // Bind the clone so the watch guard is dropped before the await.
+                    let frame = latest.borrow_and_update().clone();
+                    if let Some((seq, png)) = frame {
+                        let mut msg = seq.to_be_bytes().to_vec();
+                        msg.extend_from_slice(&png);
+                        if sender.send(Message::Binary(msg)).await.is_err() { break }
+                    }
                 }
                 changed = cursor.changed() => {
                     if changed.is_err() { break }
-                    let point = *cursor.borrow_and_update();
-                    Message::Text(serde_json::json!({ "cursor": point.map(|(x, y)| [x, y]) }).to_string())
+                    let (seq, point) = *cursor.borrow_and_update();
+                    let msg = Message::Text(
+                        serde_json::json!({ "cursor": point.map(|(x, y)| [x, y]), "seq": seq }).to_string(),
+                    );
+                    if sender.send(msg).await.is_err() { break }
                 }
-            };
-            if sender.send(msg).await.is_err() {
-                break;
             }
         }
     });
@@ -206,7 +229,7 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 async fn frame_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut latest = state.latest_png.clone();
     let png = match tokio::time::timeout(std::time::Duration::from_secs(10), latest.wait_for(Option::is_some)).await {
-        Ok(Ok(png)) => png.clone(),
+        Ok(Ok(frame)) => frame.clone().map(|(_seq, png)| png),
         _ => None,
     };
     match png {
@@ -322,16 +345,21 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         const statsEl = document.getElementById('stats');
         
         let ws = null;
-        // Last frame and pen position; the pen is a 15 px dot, as in the
-        // desktop app.
-        let frame = null, cursor = null;
+        // Last frame image and pen position; the pen is a 15 px dot, as in the
+        // desktop app. Each frame and cursor carries a sequence so the cursor is
+        // only drawn once the frame it belongs to has been shown (or resolved),
+        // never landing on an unrelated picture.
+        let frame = null, cursorPoint = null, cursorSeq = 0;
+        let displayedSeq = 0;
         function render() {
             if (!frame) return;
             ctx.drawImage(frame, 0, 0);
-            if (cursor) {
+            // Draw the cursor only once the frame it belongs to is actually on
+            // screen, so it never lands on an older or a never-shown picture.
+            if (cursorPoint && cursorSeq <= displayedSeq) {
                 ctx.fillStyle = 'rgba(244, 21, 21, 0.8)'; // desktop QML hoverCursorColor #CCF41515
                 ctx.beginPath();
-                ctx.arc(cursor[0], cursor[1], 7.5, 0, 2 * Math.PI);
+                ctx.arc(cursorPoint[0], cursorPoint[1], 7.5, 0, 2 * Math.PI);
                 ctx.fill();
             }
         }
@@ -359,22 +387,33 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             
             ws.onmessage = async (event) => {
                 if (typeof event.data === 'string') {
-                    cursor = JSON.parse(event.data).cursor;
+                    const m = JSON.parse(event.data);
+                    cursorPoint = m.cursor;
+                    cursorSeq = m.seq || 0;
+                    // Drawn now if its frame is already resolved, else when it is.
                     render();
                     return;
                 }
-                const blob = new Blob([event.data], { type: 'image/png' });
+                // Binary: 8-byte big-endian frame sequence, then the PNG bytes.
+                const view = new DataView(event.data);
+                const seq = Number(view.getBigUint64(0, false));
+                const blob = new Blob([new Uint8Array(event.data, 8)], { type: 'image/png' });
                 const img = new Image();
+                const url = URL.createObjectURL(blob);
                 img.onload = () => {
+                    URL.revokeObjectURL(url);
+                    // Never regress to a frame older than the one on screen.
+                    if (seq <= displayedSeq) { render(); return; }
                     if (canvas.width !== img.width || canvas.height !== img.height) {
                         canvas.width = img.width;
                         canvas.height = img.height;
                     }
                     frame = img;
+                    displayedSeq = seq;
                     render();
                     frameCount++;
                     fpsCount++;
-                    
+
                     const now = Date.now();
                     if (now - lastFpsTime >= 1000) {
                         currentFps = fpsCount;
@@ -383,8 +422,15 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                     }
                     statsEl.textContent = `FPS: ${currentFps} | Frames: ${frameCount}`;
                 };
-                img.src = URL.createObjectURL(blob);
-                
+                img.onerror = () => {
+                    // A failed frame is dropped entirely: it never becomes current
+                    // and never advances displayedSeq, so its cursor is not drawn
+                    // over an older picture; the cursor appears once a real frame
+                    // for its sequence (or a later one) arrives.
+                    URL.revokeObjectURL(url);
+                };
+                img.src = url;
+
                 statusEl.textContent = 'Streaming';
                 statusEl.className = 'status streaming';
             };

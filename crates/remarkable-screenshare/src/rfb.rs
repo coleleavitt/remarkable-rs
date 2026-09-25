@@ -111,6 +111,9 @@ pub struct RfbDecoder {
     rotation: i32,
     /// RGB565 pixels, row-major.
     framebuffer: Vec<u16>,
+    /// Set once the tablet sends [`Shutdown`](Event::Shutdown); no further bytes
+    /// are parsed, so a reused decoder can't apply a post-shutdown update.
+    done: bool,
 }
 
 impl RfbDecoder {
@@ -119,11 +122,29 @@ impl RfbDecoder {
     }
 
     /// Feed bytes from the data channel and decode every complete message.
+    ///
+    /// Stops for good at a [`Shutdown`](Event::Shutdown): the tablet is done
+    /// sharing, so anything after it — in this call or a later one — is discarded
+    /// and never touches the framebuffer. A stray update queued behind the
+    /// shutdown byte must not alter the last delivered frame, and once shut down
+    /// the decoder ignores all further input (start a new [`RfbDecoder`] to
+    /// decode a new session).
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<Event>> {
+        if self.done {
+            return Ok(Vec::new());
+        }
         self.buffer.extend_from_slice(data);
         let mut events = Vec::new();
         while let Some(event) = self.parse_message()? {
+            let stop = event == Event::Shutdown;
             events.push(event);
+            if stop {
+                // Enter the terminal state and drop anything queued after the
+                // shutdown, so no later feed can resurface a post-shutdown update.
+                self.done = true;
+                self.buffer.clear();
+                break;
+            }
         }
         Ok(events)
     }
@@ -333,10 +354,13 @@ impl RfbDecoder {
     /// Framebuffer pixel -> pixel of the rotated image.
     fn to_display(&self, x: u32, y: u32) -> (u32, u32) {
         let (w, h) = (u32::from(self.width), u32::from(self.height));
+        // `saturating_sub` guards a stray call before the handshake, when
+        // `w == h == 0`; for a real framebuffer `x < w` and `y < h`, so these
+        // are the plain subtractions.
         match self.clockwise_turn() {
-            90 => (h - 1 - y, x),
-            180 => (w - 1 - x, h - 1 - y),
-            270 => (y, w - 1 - x),
+            90 => (h.saturating_sub(1).saturating_sub(y), x),
+            180 => (w.saturating_sub(1).saturating_sub(x), h.saturating_sub(1).saturating_sub(y)),
+            270 => (y, w.saturating_sub(1).saturating_sub(x)),
             _ => (x, y),
         }
     }
@@ -391,13 +415,21 @@ fn inflate(input: &[u8], limit: usize) -> Result<Vec<u8>> {
     }
 }
 
-/// Gray in RGB565: what a gray value looks like after Qt converts it.
+/// Whether an RGB565 pixel is exactly what Qt produces from an 8-bit gray.
+///
+/// Qt maps gray `v` to `r5 = v >> 3`, `g6 = v >> 2`, `b5 = v >> 3`, so every
+/// gray pixel has `r5 == b5` and `r5 == g6 >> 1`; this predicate is precisely
+/// that set, not an approximation. A colour pixel that happens to satisfy it
+/// differs from true gray by at most green's low bit — i.e. is gray to within
+/// RGB565's own resolution — and [`frame`](RfbDecoder::frame) downgrades to
+/// Gray8 only when *every* pixel matches, so no colour picture is flattened.
 fn is_gray565(p: u16) -> bool {
     let (r, g, b) = ((p >> 11) & 0x1f, (p >> 5) & 0x3f, p & 0x1f);
     r == b && g >> 1 == r
 }
 
-fn rgb565_to_rgb(p: u16) -> [u8; 3] {
+/// Expand an RGB565 pixel to 8-bit R, G, B (bit-replicated, as Qt does).
+pub(crate) fn rgb565_to_rgb(p: u16) -> [u8; 3] {
     let (r, g, b) = (((p >> 11) & 0x1f) as u8, ((p >> 5) & 0x3f) as u8, (p & 0x1f) as u8);
     [(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)]
 }
@@ -663,5 +695,21 @@ mod tests {
         let mut d = RfbDecoder::new();
         let ev = d.feed(&[msg::CURSOR, 0, 5, 0, 7, msg::SHUTDOWN]).unwrap();
         assert_eq!(ev, vec![Event::Cursor { x: 5, y: 7 }, Event::Shutdown]);
+    }
+
+    #[test]
+    fn update_after_shutdown_is_ignored() {
+        let mut d = RfbDecoder::new();
+        d.feed(&handshake(2, 2)).unwrap();
+        // One message: shutdown, then a full-black update queued behind it.
+        let mut msg = vec![msg::SHUTDOWN];
+        msg.extend(update(&[(Rect { x: 0, y: 0, width: 2, height: 2 }, 0)]));
+        let ev = d.feed(&msg).unwrap();
+        assert_eq!(ev, vec![Event::Shutdown]);
+        // The post-shutdown update never reached the framebuffer.
+        assert!(d.framebuffer().iter().all(|&p| p == 0xffff));
+        // And it was discarded, so a later feed can't resurface it.
+        assert_eq!(d.feed(&[]).unwrap(), vec![]);
+        assert!(d.framebuffer().iter().all(|&p| p == 0xffff));
     }
 }
