@@ -131,6 +131,7 @@ impl UsbCapture {
         }
         
         Ok(Frame {
+            format: crate::session::PixelFormat::Gray8,
             data: raw_data[..expected_size].to_vec(),
             width: self.config.width,
             height: self.config.height,

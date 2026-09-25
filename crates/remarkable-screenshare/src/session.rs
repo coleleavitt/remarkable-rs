@@ -8,12 +8,22 @@ use tracing::{debug, info};
 use crate::error::{Error, Result};
 use crate::rfb::{Event, RfbDecoder, PING_TIMEOUT};
 
-/// An 8-bit grayscale picture of the tablet screen, rotated for display.
+/// How a [`Frame`]'s bytes are laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// One byte per pixel (reMarkable 1/2, and any all-gray screen).
+    Gray8,
+    /// Three bytes per pixel, R G B (colour screens such as the Paper Pro).
+    Rgb8,
+}
+
+/// A picture of the tablet screen, rotated for display.
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    pub format: PixelFormat,
     pub timestamp: Instant,
 }
 
@@ -70,23 +80,30 @@ pub async fn pump_frames(
             }
         }
         if changed {
-            let (data, width, height) = decoder.gray_frame();
-            on_update(Update::Frame(Frame { data, width, height, timestamp: Instant::now() }));
+            let (data, width, height, format) = decoder.frame();
+            on_update(Update::Frame(Frame { data, width, height, format, timestamp: Instant::now() }));
         }
     }
 }
 
 #[cfg(feature = "app")]
 impl Frame {
-    /// The frame as an 8-bit grayscale image.
-    pub fn to_gray_image(&self) -> image::GrayImage {
-        image::ImageBuffer::from_raw(self.width, self.height, self.data.clone())
-            .unwrap_or_else(|| image::GrayImage::new(self.width, self.height))
+    /// The frame as an image in its own pixel format.
+    pub fn to_image(&self) -> Result<image::DynamicImage> {
+        let bad = || Error::Framebuffer(format!("{} bytes don't fit {}x{} {:?}", self.data.len(), self.width, self.height, self.format));
+        Ok(match self.format {
+            PixelFormat::Gray8 => image::DynamicImage::ImageLuma8(
+                image::GrayImage::from_raw(self.width, self.height, self.data.clone()).ok_or_else(bad)?,
+            ),
+            PixelFormat::Rgb8 => image::DynamicImage::ImageRgb8(
+                image::RgbImage::from_raw(self.width, self.height, self.data.clone()).ok_or_else(bad)?,
+            ),
+        })
     }
 
     /// Save the frame as a PNG.
     pub fn save_png(&self, path: &std::path::Path) -> Result<()> {
-        self.to_gray_image()
+        self.to_image()?
             .save(path)
             .map_err(|e| Error::Io(std::io::Error::other(e)))
     }

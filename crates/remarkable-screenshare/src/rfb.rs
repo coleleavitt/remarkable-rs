@@ -37,6 +37,7 @@ use flate2::{Decompress, FlushDecompress, Status};
 use tracing::{debug, trace, warn};
 
 use crate::error::{Error, Result};
+use crate::session::PixelFormat;
 
 /// Protocol version this client speaks.
 pub const CLIENT_VERSION: i16 = 2;
@@ -274,21 +275,29 @@ impl RfbDecoder {
         &self.framebuffer
     }
 
-    /// 8-bit grayscale copy of the framebuffer with the display rotation
-    /// applied. Returns `(pixels, width, height)`.
-    pub fn gray_frame(&self) -> (Vec<u8>, u32, u32) {
+    /// The framebuffer with the display rotation applied, as 8-bit gray when
+    /// every pixel is gray (always on the rM1/rM2) and as RGB otherwise: the
+    /// Paper Pro sends its colour screen in the same RGB565 format (xochitl
+    /// 3.28 ferrari frame writer 0x7900D0 paints into QImage::Format_RGB16).
+    pub fn frame(&self) -> (Vec<u8>, u32, u32, PixelFormat) {
         let (w, h) = (self.width as usize, self.height as usize);
-        let gray: Vec<u8> = self.framebuffer.iter().map(|&p| rgb565_to_gray(p)).collect();
-        match self.rotation.rem_euclid(360) {
+        let fb = &self.framebuffer;
+        let (pixels, dw, dh) = match self.rotation.rem_euclid(360) {
             // `map` takes a destination pixel to its source pixel.
-            90 => (rotate(&gray, w, (h, w), |x, y| (y, h - 1 - x)), h as u32, w as u32),
-            180 => (rotate(&gray, w, (w, h), |x, y| (w - 1 - x, h - 1 - y)), w as u32, h as u32),
-            270 => (rotate(&gray, w, (h, w), |x, y| (w - 1 - y, x)), h as u32, w as u32),
-            _ => (gray, w as u32, h as u32),
-        }
+            90 => (rotate(fb, w, (h, w), |x, y| (y, h - 1 - x)), h, w),
+            180 => (rotate(fb, w, (w, h), |x, y| (w - 1 - x, h - 1 - y)), w, h),
+            270 => (rotate(fb, w, (h, w), |x, y| (w - 1 - y, x)), h, w),
+            _ => (fb.clone(), w, h),
+        };
+        let (data, format) = if pixels.iter().all(|&p| is_gray565(p)) {
+            (pixels.iter().map(|&p| rgb565_to_gray(p)).collect(), PixelFormat::Gray8)
+        } else {
+            (pixels.iter().flat_map(|&p| rgb565_to_rgb(p)).collect(), PixelFormat::Rgb8)
+        };
+        (data, dw as u32, dh as u32, format)
     }
 
-    /// Where framebuffer point `(x, y)` lands in [`gray_frame`](Self::gray_frame)'s
+    /// Where framebuffer point `(x, y)` lands in [`frame`](Self::frame)'s
     /// rotated image. `None` for (0, 0), which the tablet uses for "no cursor"
     /// (the desktop app doesn't draw it there), and for points off the screen.
     pub fn display_point(&self, x: u16, y: u16) -> Option<(u32, u32)> {
@@ -355,6 +364,17 @@ fn inflate(input: &[u8], limit: usize) -> Result<Vec<u8>> {
     }
 }
 
+/// Gray in RGB565: what a gray value looks like after Qt converts it.
+fn is_gray565(p: u16) -> bool {
+    let (r, g, b) = ((p >> 11) & 0x1f, (p >> 5) & 0x3f, p & 0x1f);
+    r == b && g >> 1 == r
+}
+
+fn rgb565_to_rgb(p: u16) -> [u8; 3] {
+    let (r, g, b) = (((p >> 11) & 0x1f) as u8, ((p >> 5) & 0x3f) as u8, (p & 0x1f) as u8);
+    [(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)]
+}
+
 fn rgb565_to_gray(p: u16) -> u8 {
     let r = ((p >> 11) & 0x1f) as u32;
     let g = ((p >> 5) & 0x3f) as u32;
@@ -365,7 +385,7 @@ fn rgb565_to_gray(p: u16) -> u8 {
 
 /// Build a `dw`x`dh` image from `src` (row stride `w`); `map` takes a
 /// destination pixel to its source pixel.
-fn rotate(src: &[u8], w: usize, (dw, dh): (usize, usize), map: impl Fn(usize, usize) -> (usize, usize)) -> Vec<u8> {
+fn rotate<T: Copy>(src: &[T], w: usize, (dw, dh): (usize, usize), map: impl Fn(usize, usize) -> (usize, usize)) -> Vec<T> {
     let mut dst = Vec::with_capacity(src.len());
     for y in 0..dh {
         for x in 0..dw {
@@ -451,7 +471,7 @@ mod tests {
                 Event::Ping,
             ]
         );
-        let (gray, w, h) = d.gray_frame();
+        let (gray, w, h, _) = d.frame();
         assert_eq!((w, h), (4, 3));
         assert_eq!(gray[4 + 1], 0);
         assert_eq!(gray[4 + 2], 0);
@@ -488,7 +508,7 @@ mod tests {
         let mut m = vec![msg::ROTATION];
         m.extend(90i32.to_be_bytes());
         assert_eq!(d.feed(&m).unwrap(), vec![Event::Rotation(90)]);
-        let (gray, w, h) = d.gray_frame();
+        let (gray, w, h, _) = d.frame();
         assert_eq!((w, h), (2, 3));
         // Top-left source pixel lands top-right after a clockwise turn.
         assert_eq!(gray[1], 0);
@@ -516,10 +536,34 @@ mod tests {
         // Same mapping as the pixels: a clockwise turn of a 3x2 image.
         let (gray, w, _) = {
             d.feed(&update(&[(Rect { x: 2, y: 1, width: 1, height: 1 }, 0)])).unwrap();
-            d.gray_frame()
+            let (g, w, h, _) = d.frame();
+            (g, w, h)
         };
         let (px, py) = d.display_point(2, 1).unwrap();
         assert_eq!(gray[(py * w + px) as usize], 0);
+    }
+
+    #[test]
+    fn colour_frames_come_out_as_rgb() {
+        let mut d = RfbDecoder::new();
+        d.feed(&handshake(2, 1)).unwrap();
+        // Pure red (RGB565 0xF800) at (0, 0); the rest stays white.
+        d.feed(&update(&[(Rect { x: 0, y: 0, width: 1, height: 1 }, 0xF800)])).unwrap();
+        let (rgb, w, h, format) = d.frame();
+        assert_eq!((w, h, format), (2, 1, PixelFormat::Rgb8));
+        assert_eq!(rgb, vec![255, 0, 0, 255, 255, 255]);
+    }
+
+    #[test]
+    fn gray_frames_stay_gray() {
+        let mut d = RfbDecoder::new();
+        d.feed(&handshake(2, 1)).unwrap();
+        // Mid gray 0x80 as Qt stores it in RGB565: r5=16, g6=32, b5=16.
+        let gray565 = (16 << 11) | (32 << 5) | 16;
+        d.feed(&update(&[(Rect { x: 0, y: 0, width: 1, height: 1 }, gray565)])).unwrap();
+        let (data, _, _, format) = d.frame();
+        assert_eq!(format, PixelFormat::Gray8);
+        assert_eq!(data.len(), 2);
     }
 
     #[test]

@@ -16,8 +16,6 @@ use axum::{
     Router,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
-use image::codecs::png::PngEncoder;
-use image::{GrayImage, ImageBuffer, ImageEncoder};
 use tokio::sync::{broadcast, watch};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, info, warn};
@@ -225,16 +223,12 @@ async fn frame_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 /// Convert frame to PNG bytes
 fn frame_to_png(frame: &Frame) -> Result<Vec<u8>> {
-    let img: GrayImage = ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone())
-        .ok_or_else(|| Error::Framebuffer("Invalid frame dimensions".into()))?;
-    
-    let mut buffer = Vec::new();
-    let encoder = PngEncoder::new(&mut buffer);
-    encoder
-        .write_image(&img, frame.width, frame.height, image::ExtendedColorType::L8)
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    frame
+        .to_image()?
+        .write_to(&mut buffer, image::ImageFormat::Png)
         .map_err(|e| Error::Framebuffer(format!("PNG encode error: {}", e)))?;
-    
-    Ok(buffer)
+    Ok(buffer.into_inner())
 }
 
 /// Embedded HTML page

@@ -1124,7 +1124,7 @@ async fn cmd_device(action: DeviceAction) -> Result<()> {
                     transport: Default::default(),
                     timeout: std::time::Duration::from_secs(30),
                 }).await?;
-                write_gray_png(&output, &frame)?;
+                write_png(&output, &frame)?;
                 println!("{} {}x{} screenshot to {}", "Saved".green(), frame.width, frame.height, output.display());
             } else if ssh {
                 // SSH method: grab framebuffer directly
@@ -1720,10 +1720,13 @@ async fn screen_share_frame(
     frame?.ok_or_else(|| CliError::Other("tablet sent no frame".into()))
 }
 
-fn write_gray_png(path: &std::path::Path, frame: &remarkable_screenshare::Frame) -> Result<()> {
+fn write_png(path: &std::path::Path, frame: &remarkable_screenshare::Frame) -> Result<()> {
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
     let mut encoder = png::Encoder::new(file, frame.width, frame.height);
-    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_color(match frame.format {
+        remarkable_screenshare::PixelFormat::Gray8 => png::ColorType::Grayscale,
+        remarkable_screenshare::PixelFormat::Rgb8 => png::ColorType::Rgb,
+    });
     encoder.set_depth(png::BitDepth::Eight);
     encoder
         .write_header()
