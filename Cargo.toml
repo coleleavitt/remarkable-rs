@@ -14,7 +14,6 @@ members = [
     "crates/remarkable-waveform",
     "crates/remarkable-graphql",
     "crates/remarkable-firmware",
-    "crates/remarkable-screen",
     "crates/remarkable-dbus",
     "crates/remarkable-screenshare",
 ]
@@ -33,7 +32,7 @@ remarkable-sync = { path = "crates/remarkable-sync" }
 remarkable-pdf = { path = "crates/remarkable-pdf" }
 remarkable-mqtt = { path = "crates/remarkable-mqtt" }
 remarkable-usb = { path = "crates/remarkable-usb" }
-remarkable-screen = { path = "crates/remarkable-screen" }
+remarkable-screenshare = { path = "crates/remarkable-screenshare" }
 
 # External dependencies
 serde = { version = "1.0", features = ["derive"] }
@@ -76,7 +75,6 @@ remarkable-lines.workspace = true
 remarkable-sync.workspace = true
 remarkable-mqtt.workspace = true
 remarkable-usb.workspace = true
-remarkable-screen.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
@@ -109,10 +107,6 @@ path = "tests/integration_upload.rs"
 [[test]]
 name = "integration_sync"
 path = "tests/integration_sync.rs"
-
-[[test]]
-name = "integration_screen"
-path = "tests/integration_screen.rs"
 
 [[test]]
 name = "integration_mqtt"

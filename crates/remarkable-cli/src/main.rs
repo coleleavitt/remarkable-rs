@@ -54,7 +54,6 @@ use remarkable_mqtt::{MqttClient, MqttConfig, MqttEvent};
 use remarkable_pdf::PdfAnnotator;
 use remarkable_sync::SyncClient;
 use remarkable_usb::UsbClient;
-use remarkable_screen::RfbClient;
 use serde::{Deserialize, Serialize};
 use reqwest;
 use uuid::Uuid;
@@ -75,7 +74,7 @@ pub enum CliError {
     #[error("USB error: {0}")]
     Usb(#[from] remarkable_usb::UsbError),
     #[error("Screen error: {0}")]
-    Screen(#[from] remarkable_screen::ScreenError),
+    Screen(#[from] remarkable_screenshare::Error),
     #[error("Lines error: {0}")]
     Lines(#[from] remarkable_lines::LinesError),
     #[error("PDF error: {0}")]
@@ -355,9 +354,27 @@ enum DeviceAction {
         #[arg(short, long)]
         address: Option<String>,
         
-        /// Use SSH (alternative to RFB)
+        /// Copy the raw framebuffer over SSH instead of using screen share
         #[arg(long, default_value = "false")]
         ssh: bool,
+
+        /// Take the screenshot through screen share, negotiated via this
+        /// remarkable-server broker (e.g. remarkable.unwrap.rs). Screen share
+        /// must be on on the tablet.
+        #[arg(long)]
+        cloud: Option<String>,
+
+        /// Broker TLS port
+        #[arg(long, default_value_t = 8883)]
+        broker_port: u16,
+
+        /// File holding a user token issued by the broker's server
+        #[arg(long, env = "REMARKABLE_USER_TOKEN_FILE")]
+        user_token: Option<PathBuf>,
+
+        /// User id in the broker's signaling topics
+        #[arg(long, default_value = "local-user")]
+        user_id: String,
     },
     
     /// USB Web UI operations
@@ -1089,10 +1106,24 @@ async fn cmd_device(action: DeviceAction) -> Result<()> {
             }
         }
         
-        DeviceAction::Screenshot { output, address, ssh } => {
+        DeviceAction::Screenshot { output, address, ssh, cloud, broker_port, user_token, user_id } => {
             let addr = address.as_deref().unwrap_or("10.11.99.1");
             
-            if ssh {
+            if let Some(host) = cloud {
+                let token_path = user_token.ok_or_else(|| CliError::Other("--cloud needs --user-token <file>".into()))?;
+                let user_token = std::fs::read_to_string(&token_path)?.trim().to_string();
+                println!("Capturing screenshot via screen share ({host})...");
+                let frame = screen_share_frame(remarkable_screenshare::cloud::CloudConfig {
+                    host,
+                    port: broker_port,
+                    user_token,
+                    user_id,
+                    transport: Default::default(),
+                    timeout: std::time::Duration::from_secs(30),
+                }).await?;
+                write_gray_png(&output, &frame)?;
+                println!("{} {}x{} screenshot to {}", "Saved".green(), frame.width, frame.height, output.display());
+            } else if ssh {
                 // SSH method: grab framebuffer directly
                 println!("Capturing screenshot via SSH...");
                 
@@ -1120,26 +1151,9 @@ async fn cmd_device(action: DeviceAction) -> Result<()> {
                     println!("Note: Raw framebuffer format, requires conversion");
                 }
             } else {
-                // RFB/VNC method
-                println!("Capturing screenshot via RFB...");
-                
-                let mut client = RfbClient::new();
-                client.connect(addr, 5900)?;
-                
-                let (width, height) = client.dimensions();
-                println!("Screen: {}x{}", width, height);
-                
-                client.request_update(false)?;
-                let updates = client.read_update()?;
-                
-                if let Some(update) = updates.first() {
-                    // Save raw pixel data (would need PNG encoding)
-                    std::fs::write(&output, &update.data)?;
-                    println!("{} screenshot to {}", "Saved".green(), output.display());
-                    println!("Note: Raw RGBA format, {}x{}", update.width, update.height);
-                }
-                
-                client.close();
+                return Err(CliError::Other(
+                    "choose --cloud <broker> (screen share) or --ssh (raw framebuffer)".into(),
+                ));
             }
         }
         
@@ -1675,4 +1689,38 @@ async fn cmd_config(action: ConfigAction, config_dir: &PathBuf) -> Result<()> {
     }
     
     Ok(())
+}
+
+/// Join the tablet's screen share and return its first frame.
+async fn screen_share_frame(
+    cfg: remarkable_screenshare::cloud::CloudConfig,
+) -> Result<remarkable_screenshare::Frame> {
+    let remarkable_screenshare::cloud::CloudSession { webrtc, mut data_rx, signaling_task } =
+        remarkable_screenshare::cloud::connect(cfg).await?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut tx = Some(tx);
+    let pump = remarkable_screenshare::pump_frames(&mut data_rx, |frame| {
+        if let Some(tx) = tx.take() {
+            let _ = tx.send(frame);
+        }
+    });
+    let frame = tokio::select! {
+        frame = rx => frame.ok(),
+        ended = pump => { ended?; None }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => None,
+    };
+    signaling_task.abort();
+    let _ = webrtc.close().await;
+    frame.ok_or_else(|| CliError::Other("tablet sent no frame".into()))
+}
+
+fn write_gray_png(path: &std::path::Path, frame: &remarkable_screenshare::Frame) -> Result<()> {
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut encoder = png::Encoder::new(file, frame.width, frame.height);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .and_then(|mut w| w.write_image_data(&frame.data))
+        .map_err(|e| CliError::Other(format!("PNG encode failed: {e}")))
 }

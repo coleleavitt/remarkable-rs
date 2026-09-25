@@ -13,7 +13,7 @@ A comprehensive Rust library for interacting with reMarkable e-paper tablets.
 | `remarkable-pdf` | PDF annotation overlay |
 | `remarkable-usb` | USB WebUI client |
 | `remarkable-dbus` | D-Bus device control |
-| `remarkable-screen` | Framebuffer access |
+| `remarkable-screenshare` | Screen share: RFB v2 protocol, WebRTC transport, frame session |
 | `remarkable-firmware` | Firmware extraction (CrAU/SWU) |
 | `remarkable-waveform` | Waveform format parsing |
 | `remarkable-template` | Template management |

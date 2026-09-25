@@ -18,7 +18,8 @@ remarkable-sync.workspace = true
 remarkable-pdf.workspace = true
 remarkable-mqtt.workspace = true
 remarkable-usb.workspace = true
-remarkable-screen.workspace = true
+remarkable-screenshare = { workspace = true, features = ["cloud"] }
+png = "0.17"
 
 # External dependencies
 walkdir = "2"
