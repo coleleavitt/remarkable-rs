@@ -1,9 +1,0 @@
-[package]
-name = "remarkable-screen"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Screen share client for reMarkable (RFB/VNC and WebRTC)"
-
-[dependencies]
-thiserror = { workspace = true }
