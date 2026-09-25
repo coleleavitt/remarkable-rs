@@ -97,6 +97,12 @@ impl WebServer {
                         Ok(frame) => match frame_to_png(&frame) {
                             Ok(png) => {
                                 png_tx.send_replace(Some(Arc::new(png)));
+                                // Flush a pending cursor right after its frame, so
+                                // a steady stream of frames can't starve cursor
+                                // updates under the biased select above.
+                                if cursor.has_changed().unwrap_or(false) {
+                                    cursor_tx.send_replace(*cursor.borrow_and_update());
+                                }
                             }
                             Err(e) => warn!("Failed to encode frame: {}", e),
                         },
@@ -106,8 +112,7 @@ impl WebServer {
                     },
                     changed = cursor.changed() => {
                         if changed.is_err() { break }
-                        let point = *cursor.borrow_and_update();
-                        cursor_tx.send_replace(point);
+                        cursor_tx.send_replace(*cursor.borrow_and_update());
                     }
                 }
             }
