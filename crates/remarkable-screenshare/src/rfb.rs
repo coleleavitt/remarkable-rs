@@ -73,7 +73,7 @@ pub struct Rect {
 }
 
 impl Rect {
-    fn union(self, other: Rect) -> Rect {
+    pub(crate) fn union(self, other: Rect) -> Rect {
         if self.width == 0 || self.height == 0 {
             return other;
         }
@@ -314,12 +314,31 @@ impl RfbDecoder {
         if (x, y) == (0, 0) || x >= w || y >= h {
             return None;
         }
-        Some(match self.clockwise_turn() {
+        Some(self.to_display(x, y))
+    }
+
+    /// `rect` of the framebuffer as `(x, y, width, height)` in the rotated
+    /// image, clipped to the screen.
+    pub fn display_rect(&self, rect: Rect) -> (u32, u32, u32, u32) {
+        let (w, h) = (u32::from(self.width), u32::from(self.height));
+        let x0 = u32::from(rect.x).min(w.saturating_sub(1));
+        let y0 = u32::from(rect.y).min(h.saturating_sub(1));
+        let x1 = (u32::from(rect.x) + u32::from(rect.width)).min(w).max(x0 + 1) - 1;
+        let y1 = (u32::from(rect.y) + u32::from(rect.height)).min(h).max(y0 + 1) - 1;
+        let (ax, ay) = self.to_display(x0, y0);
+        let (bx, by) = self.to_display(x1, y1);
+        (ax.min(bx), ay.min(by), ax.abs_diff(bx) + 1, ay.abs_diff(by) + 1)
+    }
+
+    /// Framebuffer pixel -> pixel of the rotated image.
+    fn to_display(&self, x: u32, y: u32) -> (u32, u32) {
+        let (w, h) = (u32::from(self.width), u32::from(self.height));
+        match self.clockwise_turn() {
             90 => (h - 1 - y, x),
             180 => (w - 1 - x, h - 1 - y),
             270 => (y, w - 1 - x),
             _ => (x, y),
-        })
+        }
     }
 }
 
@@ -573,6 +592,26 @@ mod tests {
         let (data, _, _, format) = d.frame();
         assert_eq!(format, PixelFormat::Gray8);
         assert_eq!(data.len(), 2);
+    }
+
+    #[test]
+    fn display_rect_matches_rotated_pixels() {
+        let mut d = RfbDecoder::new();
+        d.feed(&handshake(4, 3)).unwrap();
+        let r = Rect { x: 1, y: 0, width: 2, height: 1 };
+        assert_eq!(d.display_rect(r), (1, 0, 2, 1));
+        let mut m = vec![msg::ROTATION];
+        m.extend(90i32.to_be_bytes());
+        d.feed(&m).unwrap();
+        d.feed(&update(&[(r, 0)])).unwrap();
+        let (gray, w, _, _) = d.frame();
+        let (x, y, rw, rh) = d.display_rect(r);
+        // Every black pixel lies inside the reported rect.
+        for (i, &p) in gray.iter().enumerate() {
+            let (px, py) = ((i as u32) % w, (i as u32) / w);
+            let inside = px >= x && px < x + rw && py >= y && py < y + rh;
+            assert_eq!(p == 0, inside, "pixel ({px},{py})");
+        }
     }
 
     #[test]

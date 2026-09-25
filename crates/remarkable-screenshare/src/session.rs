@@ -17,6 +17,15 @@ pub enum PixelFormat {
     Rgb8,
 }
 
+/// A rectangle of a [`Frame`], in its pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Area {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// A picture of the tablet screen, rotated for display.
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -24,7 +33,17 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
+    /// What changed since the previous frame (the whole frame after a
+    /// handshake or rotation). Lets viewers repaint only that part.
+    pub changed: Area,
     pub timestamp: Instant,
+}
+
+impl Frame {
+    /// The whole frame as an [`Area`].
+    pub fn full_area(&self) -> Area {
+        Area { x: 0, y: 0, width: self.width, height: self.height }
+    }
 }
 
 /// What [`pump_frames`] reports.
@@ -56,20 +75,29 @@ pub async fn pump_frames(
             Err(_) => return Err(Error::Timeout(format!("no data from tablet for {PING_TIMEOUT:?}"))),
         };
         let mut changed = false;
+        // Union of this message's updates; `None` with `changed` means everything.
+        let mut dirty: Option<crate::rfb::Rect> = None;
+        let mut everything = false;
         for event in decoder.feed(&data)? {
             match event {
                 Event::Handshake { version, width, height } => {
                     info!("Screen share handshake: server v{version} {width}x{height}");
+                    // A new framebuffer: the next frame replaces the whole picture.
+                    everything = true;
                     on_update(Update::Connected { width, height });
                 }
-                Event::FramebufferUpdated { dirty, rects } => {
-                    debug!("Framebuffer update: {rects} rects, dirty {dirty:?}");
+                Event::FramebufferUpdated { dirty: rect, rects } => {
+                    debug!("Framebuffer update: {rects} rects, dirty {rect:?}");
                     // Updates whose rects were all skipped change nothing.
-                    changed |= dirty.width > 0 && dirty.height > 0;
+                    if rect.width > 0 && rect.height > 0 {
+                        changed = true;
+                        dirty = Some(dirty.map_or(rect, |d| d.union(rect)));
+                    }
                 }
                 Event::Rotation(degrees) => {
                     info!("Tablet rotation: {degrees}°");
                     changed = decoder.is_ready();
+                    everything = true;
                 }
                 Event::Cursor { x, y } => on_update(Update::Cursor(decoder.display_point(x, y))),
                 Event::Ping => debug!("Ping"),
@@ -81,7 +109,14 @@ pub async fn pump_frames(
         }
         if changed {
             let (data, width, height, format) = decoder.frame();
-            on_update(Update::Frame(Frame { data, width, height, format, timestamp: Instant::now() }));
+            let changed = match dirty {
+                Some(rect) if !everything => {
+                    let (x, y, width, height) = decoder.display_rect(rect);
+                    Area { x, y, width, height }
+                }
+                _ => Area { x: 0, y: 0, width, height },
+            };
+            on_update(Update::Frame(Frame { data, width, height, format, changed, timestamp: Instant::now() }));
         }
     }
 }
@@ -137,6 +172,21 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].width, frames[0].height), (4, 2));
         assert!(frames[0].data.iter().all(|&p| p == 0));
+    }
+
+    #[tokio::test]
+    async fn frames_report_what_changed() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(handshake(4, 2)).unwrap();
+        tx.send(update(&[(Rect { x: 0, y: 0, width: 4, height: 2 }, 0)])).unwrap();
+        tx.send(update(&[(Rect { x: 1, y: 1, width: 2, height: 1 }, 0xffff)])).unwrap();
+        tx.send(vec![0x65]).unwrap();
+        let mut areas = Vec::new();
+        pump_frames(&mut rx, |u| if let Update::Frame(f) = u { areas.push(f.changed) }).await.unwrap();
+        assert_eq!(areas, vec![
+            Area { x: 0, y: 0, width: 4, height: 2 },
+            Area { x: 1, y: 1, width: 2, height: 1 },
+        ]);
     }
 
     #[tokio::test]
