@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, watch, RwLock};
 use tracing::{error, info};
 
 use crate::cloud::CloudConfig;
@@ -38,7 +38,11 @@ pub struct ScreenShareViewer {
     /// Bumped by every start, so a superseded background task can't
     /// overwrite the state of a newer one.
     generation: Arc<AtomicU64>,
+    /// The running producer; a new start stops it.
+    task: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
     frame_tx: broadcast::Sender<Frame>,
+    /// Pen position in the current frame's pixels (cloud sessions).
+    cursor_tx: watch::Sender<Option<(u32, u32)>>,
 }
 
 /// Set `state` only while `gen` is still the current generation.
@@ -52,7 +56,14 @@ async fn set_state(state: &RwLock<ViewerState>, generation: &AtomicU64, gen: u64
 impl ScreenShareViewer {
     pub fn new(source: ViewerSource) -> Self {
         let (frame_tx, _) = broadcast::channel(4);
-        Self { source, state: Arc::new(RwLock::new(ViewerState::Disconnected)), generation: Arc::default(), frame_tx }
+        Self {
+            source,
+            state: Arc::new(RwLock::new(ViewerState::Disconnected)),
+            generation: Arc::default(),
+            task: std::sync::Mutex::default(),
+            frame_tx,
+            cursor_tx: watch::channel(None).0,
+        }
     }
 
     pub async fn state(&self) -> ViewerState {
@@ -62,6 +73,19 @@ impl ScreenShareViewer {
     /// Subscribe to frame updates
     pub fn subscribe(&self) -> broadcast::Receiver<Frame> {
         self.frame_tx.subscribe()
+    }
+
+    /// Follow the pen position; `None` means no cursor.
+    pub fn cursor(&self) -> watch::Receiver<Option<(u32, u32)>> {
+        self.cursor_tx.subscribe()
+    }
+
+    /// Run `producer` as the viewer's only background task.
+    fn replace_task(&self, producer: impl std::future::Future<Output = ()> + Send + 'static) {
+        let handle = tokio::spawn(producer).abort_handle();
+        if let Some(old) = self.task.lock().unwrap_or_else(|e| e.into_inner()).replace(handle) {
+            old.abort();
+        }
     }
 
     /// Start producing frames in the background.
@@ -87,17 +111,22 @@ impl ScreenShareViewer {
         // Before spawning, so the task's Streaming state can't be overwritten.
         *self.state.write().await = ViewerState::Connected;
         let frame_tx = self.frame_tx.clone();
+        let cursor_tx = self.cursor_tx.clone();
         let state = self.state.clone();
         let generation = self.generation.clone();
-        tokio::spawn(async move {
+        self.replace_task(async move {
             // Own the session here so the peer connection and signaling task live
             // exactly as long as frames are flowing.
             let crate::cloud::CloudSession { webrtc, mut data_rx, signaling_task } = session;
             set_state(&state, &generation, gen, ViewerState::Streaming).await;
-            if let Err(e) = pump_frames(&mut data_rx, |update| {
-                if let Update::Frame(frame) = update {
+            if let Err(e) = pump_frames(&mut data_rx, |update| match update {
+                Update::Frame(frame) => {
                     let _ = frame_tx.send(frame);
                 }
+                Update::Cursor(point) => {
+                    cursor_tx.send_replace(point);
+                }
+                Update::Connected { .. } => {}
             })
             .await
             {
@@ -127,7 +156,7 @@ impl ScreenShareViewer {
         let frame_tx = self.frame_tx.clone();
         let state = self.state.clone();
         let generation = self.generation.clone();
-        tokio::spawn(async move {
+        self.replace_task(async move {
             set_state(&state, &generation, gen, ViewerState::Streaming).await;
             while let Some(frame) = frame_rx.recv().await {
                 let _ = frame_tx.send(frame);
@@ -156,5 +185,31 @@ impl ScreenShareViewer {
                 .await
                 .map_err(|_| Error::Timeout("No frame received".into())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usb::UsbConfig;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_new_task_stops_the_previous_one() {
+        let viewer = ScreenShareViewer::new(ViewerSource::Usb(UsbConfig::default()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = tx.clone();
+        viewer.replace_task(async move {
+            loop {
+                let _ = first.send("first");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        viewer.replace_task(async {});
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while rx.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "the first task is still running");
     }
 }

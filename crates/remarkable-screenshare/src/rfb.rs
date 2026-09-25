@@ -338,6 +338,10 @@ fn inflate(input: &[u8], limit: usize) -> Result<Vec<u8>> {
         let status = z
             .decompress_vec(&input[consumed..], &mut out, FlushDecompress::Sync)
             .map_err(|e| Error::RfbProtocol(format!("failed to read zstream: {e}")))?;
+        // `reserve` may allocate more than asked, so check the output itself.
+        if out.len() > limit {
+            return Err(Error::RfbProtocol(format!("inflated update larger than {limit} bytes")));
+        }
         let done_input = z.total_in() as usize == input.len();
         match status {
             Status::StreamEnd => return Ok(out),
