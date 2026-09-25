@@ -352,6 +352,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         // Last frame and pen position; the pen is a 15 px dot, as in the
         // desktop app.
         let frame = null, cursor = null;
+        // Frame ordering: only the newest image is displayed, and a cursor is
+        // held until the frame it belongs to has finished decoding, so it never
+        // lands on the previous picture.
+        let latestSeq = 0, displayedSeq = 0;
         function render() {
             if (!frame) return;
             ctx.drawImage(frame, 0, 0);
@@ -387,21 +391,29 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             ws.onmessage = async (event) => {
                 if (typeof event.data === 'string') {
                     cursor = JSON.parse(event.data).cursor;
-                    render();
+                    // If a newer frame is still decoding, wait for it (its onload
+                    // will render with this cursor) so the cursor lands on it.
+                    if (displayedSeq === latestSeq) render();
                     return;
                 }
+                const seq = ++latestSeq;
                 const blob = new Blob([event.data], { type: 'image/png' });
                 const img = new Image();
+                const url = URL.createObjectURL(blob);
                 img.onload = () => {
+                    URL.revokeObjectURL(url);
+                    // A newer frame arrived while this one decoded: discard it.
+                    if (seq < latestSeq) return;
                     if (canvas.width !== img.width || canvas.height !== img.height) {
                         canvas.width = img.width;
                         canvas.height = img.height;
                     }
                     frame = img;
+                    displayedSeq = seq;
                     render();
                     frameCount++;
                     fpsCount++;
-                    
+
                     const now = Date.now();
                     if (now - lastFpsTime >= 1000) {
                         currentFps = fpsCount;
@@ -410,7 +422,12 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                     }
                     statsEl.textContent = `FPS: ${currentFps} | Frames: ${frameCount}`;
                 };
-                img.src = URL.createObjectURL(blob);
+                img.onerror = () => {
+                    URL.revokeObjectURL(url);
+                    // Don't strand later cursors waiting on a frame that failed.
+                    if (seq === latestSeq) { displayedSeq = seq; render(); }
+                };
+                img.src = url;
                 
                 statusEl.textContent = 'Streaming';
                 statusEl.className = 'status streaming';

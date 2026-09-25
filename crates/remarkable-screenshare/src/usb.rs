@@ -67,12 +67,16 @@ impl UsbConfig {
 
     /// This config updated from what the device actually reports.
     ///
-    /// Always takes the detected `depth` (the reason detection exists — a Paper
-    /// Pro is 16-bit RGB565, not 8-bit gray). Keeps caller-supplied dimensions,
-    /// only auto-filling geometry that is still the default, so a config with
+    /// If detection failed, the caller's config is kept unchanged rather than
+    /// overwritten with fallback values. Otherwise it takes the detected `depth`
+    /// (the reason detection exists — a Paper Pro is 16-bit RGB565, not 8-bit
+    /// gray) and auto-fills geometry only when it is still the default, so
     /// deliberately non-default dimensions (or a custom `fb_device`, which
-    /// `fbset -i` does not describe) is respected rather than overwritten.
+    /// `fbset -i` does not describe) are respected rather than clobbered.
     pub(crate) fn with_device(self, info: &DeviceInfo) -> Self {
+        if !info.detected {
+            return self;
+        }
         let default_geometry = self.width == FB_WIDTH && self.height == FB_HEIGHT;
         Self {
             depth: info.depth,
@@ -91,6 +95,9 @@ pub struct DeviceInfo {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
+    /// Whether `width`/`height`/`depth` came from the device (via `fbset`)
+    /// rather than the caller's fallback config.
+    pub detected: bool,
 }
 
 /// USB framebuffer capture
@@ -138,23 +145,29 @@ impl UsbCapture {
         let version_output = self.run_ssh_command("cat /etc/version 2>/dev/null || echo unknown").await?;
         let firmware_version = version_output.trim().to_string();
         
-        // Get framebuffer info using fbset
-        let fbset_output = self.run_ssh_command("fbset -i 2>/dev/null || echo 'geometry 1872 1404 1872 1404 8'").await?;
-        let (width, height, depth) = parse_fbset_output(&fbset_output);
-        
+        // Get framebuffer info using fbset. If it gives us nothing, fall back to
+        // the caller's configured geometry (not a hardcoded guess) and flag that
+        // detection did not happen, so we don't mislabel the framebuffer.
+        let fbset_output = self.run_ssh_command("fbset -i 2>/dev/null || true").await?;
+        let (width, height, depth, detected) = match parse_fbset_output(&fbset_output) {
+            Some((w, h, d)) => (w, h, d, true),
+            None => (self.config.width, self.config.height, self.config.depth, false),
+        };
+
         // Detect model from dimensions
         let model = match (width, height) {
             (1404, 1872) | (1872, 1404) => "reMarkable 2",
             (2880, 2160) | (2160, 2880) => "reMarkable Paper Pro",
             _ => "Unknown",
         }.to_string();
-        
+
         Ok(DeviceInfo {
             model,
             firmware_version,
             width,
             height,
             depth,
+            detected,
         })
     }
     
@@ -304,24 +317,22 @@ fn decode_framebuffer(raw: &[u8], pixels: usize, depth: u32) -> (Vec<u8>, crate:
     }
 }
 
-/// Parse fbset output to get dimensions
-fn parse_fbset_output(output: &str) -> (u32, u32, u32) {
-    let mut width = FB_WIDTH;
-    let mut height = FB_HEIGHT;
-    let mut depth = 8;
-    
+/// Parse fbset output for `(width, height, depth)`; `None` if it has no usable
+/// `geometry` line (so the caller can tell detection failed rather than silently
+/// using a guess).
+fn parse_fbset_output(output: &str) -> Option<(u32, u32, u32)> {
     for line in output.lines() {
         if line.contains("geometry") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 6 {
-                width = parts[1].parse().unwrap_or(width);
-                height = parts[2].parse().unwrap_or(height);
-                depth = parts[5].parse().unwrap_or(depth);
+                let width = parts[1].parse().ok()?;
+                let height = parts[2].parse().ok()?;
+                let depth = parts[5].parse().ok()?;
+                return Some((width, height, depth));
             }
         }
     }
-    
-    (width, height, depth)
+    None
 }
 
 /// Quote `s` as one word for a POSIX shell.
@@ -360,9 +371,42 @@ mod tests {
         let output = r#"mode "1872x1404"
     geometry 1872 1404 1872 1404 8
 "#;
-        let (w, h, d) = parse_fbset_output(output);
-        assert_eq!(w, 1872);
-        assert_eq!(h, 1404);
-        assert_eq!(d, 8);
+        assert_eq!(parse_fbset_output(output), Some((1872, 1404, 8)));
+    }
+
+    #[test]
+    fn parse_fbset_returns_none_without_geometry() {
+        assert_eq!(parse_fbset_output(""), None);
+        assert_eq!(parse_fbset_output("fbset: not found"), None);
+    }
+
+    #[test]
+    fn with_device_keeps_config_when_detection_failed() {
+        let cfg = UsbConfig { width: 100, height: 200, depth: 16, ..UsbConfig::default() };
+        let info = DeviceInfo {
+            model: "Unknown".into(),
+            firmware_version: "x".into(),
+            width: FB_WIDTH,
+            height: FB_HEIGHT,
+            depth: 8,
+            detected: false,
+        };
+        let out = cfg.clone().with_device(&info);
+        assert_eq!((out.width, out.height, out.depth), (100, 200, 16));
+    }
+
+    #[test]
+    fn with_device_applies_detected_values() {
+        let info = DeviceInfo {
+            model: "reMarkable Paper Pro".into(),
+            firmware_version: "x".into(),
+            width: 2160,
+            height: 2880,
+            depth: 16,
+            detected: true,
+        };
+        // A default-geometry config is corrected to the detected colour screen.
+        let out = UsbConfig::default().with_device(&info);
+        assert_eq!((out.width, out.height, out.depth), (2160, 2880, 16));
     }
 }

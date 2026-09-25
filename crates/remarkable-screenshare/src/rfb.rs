@@ -111,6 +111,9 @@ pub struct RfbDecoder {
     rotation: i32,
     /// RGB565 pixels, row-major.
     framebuffer: Vec<u16>,
+    /// Set once the tablet sends [`Shutdown`](Event::Shutdown); no further bytes
+    /// are parsed, so a reused decoder can't apply a post-shutdown update.
+    done: bool,
 }
 
 impl RfbDecoder {
@@ -120,19 +123,25 @@ impl RfbDecoder {
 
     /// Feed bytes from the data channel and decode every complete message.
     ///
-    /// Stops at a [`Shutdown`](Event::Shutdown): the tablet is done sharing, so
-    /// anything after it is discarded and never touches the framebuffer — a stray
-    /// update queued behind the shutdown byte must not alter the last delivered
-    /// frame, nor resurface if the decoder is fed again.
+    /// Stops for good at a [`Shutdown`](Event::Shutdown): the tablet is done
+    /// sharing, so anything after it — in this call or a later one — is discarded
+    /// and never touches the framebuffer. A stray update queued behind the
+    /// shutdown byte must not alter the last delivered frame, and once shut down
+    /// the decoder ignores all further input (start a new [`RfbDecoder`] to
+    /// decode a new session).
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<Event>> {
+        if self.done {
+            return Ok(Vec::new());
+        }
         self.buffer.extend_from_slice(data);
         let mut events = Vec::new();
         while let Some(event) = self.parse_message()? {
-            let done = event == Event::Shutdown;
+            let stop = event == Event::Shutdown;
             events.push(event);
-            if done {
-                // Drop anything queued after the shutdown so a reused decoder
-                // can't parse and apply a post-shutdown update on a later feed.
+            if stop {
+                // Enter the terminal state and drop anything queued after the
+                // shutdown, so no later feed can resurface a post-shutdown update.
+                self.done = true;
                 self.buffer.clear();
                 break;
             }
