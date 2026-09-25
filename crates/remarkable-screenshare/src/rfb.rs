@@ -163,9 +163,9 @@ impl RfbDecoder {
                 if self.framebuffer.is_empty() {
                     return Err(Error::RfbProtocol("framebuffer update before handshake".into()));
                 }
-                // A valid update holds at most one 12-byte header per rect and
-                // pixels for the whole framebuffer; allow overlap once over.
-                let limit = 12 * rects as usize + 2 * 2 * self.framebuffer.len();
+                // xochitl sends the non-overlapping rects of a QRegion: at most
+                // one 12-byte header per rect plus 2 bytes per framebuffer pixel.
+                let limit = 12 * rects as usize + 2 * self.framebuffer.len();
                 let raw = inflate(&body[6..6 + compressed_len], limit)?;
                 let dirty = self.apply_rects(&raw, rects)?;
                 (Event::FramebufferUpdated { dirty, rects }, 6 + compressed_len)
@@ -303,16 +303,19 @@ fn be32(b: &[u8], at: usize) -> u32 {
 /// `Z_PARTIAL_FLUSH`, so there is no end-of-stream marker; like the desktop
 /// client, inflate until the input is used up.
 ///
-/// Fails once the output would exceed `limit` bytes.
+/// Fails if the output exceeds `limit` bytes.
 fn inflate(input: &[u8], limit: usize) -> Result<Vec<u8>> {
+    // One byte of headroom: a buffer filled to exactly `limit + 1` proves the
+    // output is too big, while exactly `limit` bytes still ends normally.
+    let cap = limit + 1;
     let mut z = Decompress::new(true);
-    let mut out = Vec::with_capacity((input.len() * 8).min(limit));
+    let mut out = Vec::with_capacity((input.len() * 8).min(cap));
     loop {
         if out.len() == out.capacity() {
-            if out.len() >= limit {
+            if out.len() >= cap {
                 return Err(Error::RfbProtocol(format!("inflated update larger than {limit} bytes")));
             }
-            out.reserve(out.capacity().max(64 * 1024).min(limit - out.len()));
+            out.reserve(out.capacity().max(64 * 1024).min(cap - out.len()));
         }
         let consumed = z.total_in() as usize;
         let status = z
@@ -494,6 +497,14 @@ mod tests {
         let empty = Rect { x: 0, y: 0, width: 0, height: 2 };
         let ev = d.feed(&update(&[(empty, 0)])).unwrap();
         assert_eq!(ev, vec![Event::FramebufferUpdated { dirty: Rect::default(), rects: 1 }]);
+    }
+
+    #[test]
+    fn inflate_accepts_output_of_exactly_the_limit() {
+        let raw = vec![7u8; 1000];
+        let z = testdata::partial_flushed_zlib(&raw);
+        assert_eq!(inflate(&z, 1000).unwrap(), raw);
+        assert!(inflate(&z, 999).is_err());
     }
 
     #[test]
