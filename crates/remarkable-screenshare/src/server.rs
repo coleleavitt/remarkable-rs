@@ -350,11 +350,13 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         // only drawn once the frame it belongs to has been shown (or resolved),
         // never landing on an unrelated picture.
         let frame = null, cursorPoint = null, cursorSeq = 0;
-        let displayedSeq = 0, resolvedSeq = 0;
+        let displayedSeq = 0;
         function render() {
             if (!frame) return;
             ctx.drawImage(frame, 0, 0);
-            if (cursorPoint && cursorSeq <= resolvedSeq) {
+            // Draw the cursor only once the frame it belongs to is actually on
+            // screen, so it never lands on an older or a never-shown picture.
+            if (cursorPoint && cursorSeq <= displayedSeq) {
                 ctx.fillStyle = 'rgba(244, 21, 21, 0.8)'; // desktop QML hoverCursorColor #CCF41515
                 ctx.beginPath();
                 ctx.arc(cursorPoint[0], cursorPoint[1], 7.5, 0, 2 * Math.PI);
@@ -400,7 +402,6 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 const url = URL.createObjectURL(blob);
                 img.onload = () => {
                     URL.revokeObjectURL(url);
-                    if (seq > resolvedSeq) resolvedSeq = seq;
                     // Never regress to a frame older than the one on screen.
                     if (seq <= displayedSeq) { render(); return; }
                     if (canvas.width !== img.width || canvas.height !== img.height) {
@@ -422,11 +423,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                     statsEl.textContent = `FPS: ${currentFps} | Frames: ${frameCount}`;
                 };
                 img.onerror = () => {
+                    // A failed frame is dropped entirely: it never becomes current
+                    // and never advances displayedSeq, so its cursor is not drawn
+                    // over an older picture; the cursor appears once a real frame
+                    // for its sequence (or a later one) arrives.
                     URL.revokeObjectURL(url);
-                    // A failed frame is still "resolved" so cursors waiting on it
-                    // (or a later frame) aren't stranded; it never becomes current.
-                    if (seq > resolvedSeq) resolvedSeq = seq;
-                    render();
                 };
                 img.src = url;
 
