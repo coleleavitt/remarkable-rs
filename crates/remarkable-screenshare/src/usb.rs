@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, Mutex};
 use tokio::time;
-use tracing::{error, warn};
+use tracing::warn;
 
 use crate::error::{Error, Result};
 pub use crate::session::Frame;
@@ -118,7 +118,7 @@ impl UsbCapture {
         let start = std::time::Instant::now();
         
         // Read framebuffer
-        let raw_data = self.run_ssh_command_binary(&format!("cat {}", self.config.fb_device)).await?;
+        let raw_data = self.run_ssh_command_binary(&format!("cat {}", shell_quote(&self.config.fb_device))).await?;
         
         // Validate size
         let expected_size = self.config.width as usize * self.config.height as usize;
@@ -140,6 +140,9 @@ impl UsbCapture {
     
     /// Start continuous capture
     pub async fn start_continuous(&self, fps: u32) -> Result<mpsc::Receiver<Frame>> {
+        if fps == 0 {
+            return Err(Error::Framebuffer("capture rate must be at least 1 fps".into()));
+        }
         let (tx, rx) = mpsc::channel(2);
         let config = self.config.clone();
         let running = self.running.clone();
@@ -246,59 +249,22 @@ fn parse_fbset_output(output: &str) -> (u32, u32, u32) {
     (width, height, depth)
 }
 
-/// Streaming framebuffer capture using reStream protocol
-pub struct ReStreamCapture {
-    config: UsbConfig,
-}
-
-impl ReStreamCapture {
-    pub fn new() -> Self {
-        Self::with_config(UsbConfig::default())
-    }
-    
-    pub fn with_config(config: UsbConfig) -> Self {
-        Self { config }
-    }
-    
-    /// Start streaming capture using lz4 compression
-    /// This is the protocol used by reStream for efficient capture
-    pub async fn start_streaming(&self) -> Result<mpsc::Receiver<Frame>> {
-        let (tx, rx) = mpsc::channel(4);
-        let config = self.config.clone();
-        
-        tokio::spawn(async move {
-            // Use the reStream approach: stream with lz4 compression
-            let _cmd = format!(
-                "while true; do cat {} | lz4 -c; done",
-                config.fb_device
-            );
-            
-            // This is a placeholder - real implementation would use async SSH
-            // and decompress the lz4 stream on the fly
-            loop {
-                let capture = UsbCapture::with_config(config.clone());
-                match capture.capture_frame().await {
-                    Ok(frame) => {
-                        if tx.send(frame).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Stream capture error: {}", e);
-                        time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        });
-        
-        Ok(rx)
-    }
+/// Quote `s` as one word for a POSIX shell.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     
+    #[test]
+    fn shell_quote_keeps_one_word() {
+        assert_eq!(shell_quote("/dev/fb0"), "'/dev/fb0'");
+        assert_eq!(shell_quote("x; rm -rf /"), "'x; rm -rf /'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
     #[test]
     fn test_parse_fbset() {
         let output = r#"mode "1872x1404"

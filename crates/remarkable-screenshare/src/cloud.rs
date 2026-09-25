@@ -27,7 +27,7 @@ use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
-use crate::webrtc::{TransportConfig, WebRtcHandler};
+use crate::webrtc::{IceServer, TransportConfig, WebRtcHandler};
 
 /// Settings for cloud (internet) screenshare.
 #[derive(Debug, Clone)]
@@ -100,10 +100,11 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
     // --- Phase 1: connect, join room, collect offer + early candidates ---
     let deadline = tokio::time::Instant::now() + cfg.timeout;
     let mut room_id: Option<String> = None;
-    let mut tablet_cid: Option<String> = None;
-    let mut early_cands: Vec<(String, Option<String>)> = Vec::new();
+    let mut broker_ice: Vec<IceServer> = Vec::new();
+    // Candidates can arrive before the offer; keep their sender to match later.
+    let mut early_cands: Vec<(String, String, Option<String>)> = Vec::new();
 
-    let offer = loop {
+    let (tablet_cid, offer) = loop {
         let ev = tokio::time::timeout_at(deadline, eventloop.poll())
             .await
             .map_err(|_| Error::Timeout(match &room_id {
@@ -124,8 +125,9 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
             }
             Event::Incoming(Packet::Publish(p)) => match SignalingEvent::from_bytes(&p.payload) {
                 Some(SignalingEvent::RoomNotFound) => return Err(Error::DeviceNotReady),
-                Some(SignalingEvent::RoomJoined { room_id: r, .. }) if room_id.is_none() => {
+                Some(SignalingEvent::RoomJoined { room_id: r, ice_servers }) if room_id.is_none() => {
                     info!("cloud: joined room {r}; requesting offer");
+                    broker_ice = ice_servers.as_ref().map(parse_ice_servers).unwrap_or_default();
                     signaler
                         .send(&SignalingRequest::Broadcast {
                             room_id: r.clone(),
@@ -134,14 +136,13 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
                         .await?;
                     room_id = Some(r);
                 }
-                Some(SignalingEvent::Direct { client_id, payload: PeerMessage::WebRtc { payload } }) => {
-                    tablet_cid.get_or_insert(client_id);
+                Some(SignalingEvent::Direct { client_id, payload: PeerMessage::WebRtc { payload } }) if room_id.is_some() => {
                     match payload {
                         WebRtcMessage::Offer { description } => {
-                            info!("cloud: got offer from tablet");
-                            break description;
+                            info!("cloud: got offer from tablet {client_id}");
+                            break (client_id, description);
                         }
-                        WebRtcMessage::Candidate { candidate, mid } => early_cands.push((candidate, mid)),
+                        WebRtcMessage::Candidate { candidate, mid } => early_cands.push((client_id, candidate, mid)),
                         WebRtcMessage::Answer { .. } => debug!("cloud: ignoring answer"),
                     }
                 }
@@ -152,17 +153,20 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
     };
 
     let room_id = room_id.ok_or_else(|| sig_err("offer without room"))?;
-    let tablet_cid = tablet_cid.ok_or_else(|| sig_err("offer without clientId"))?;
 
     // --- Phase 2: WebRTC answer ---
-    let (webrtc, mut ice_rx, data_rx) = WebRtcHandler::new(cfg.transport.clone()).await?;
+    // The broker's STUN/TURN servers (room-joined) come on top of our own.
+    let mut transport = cfg.transport.clone();
+    transport.ice_servers.extend(broker_ice);
+    let (webrtc, mut ice_rx, data_rx) = WebRtcHandler::new(transport).await?;
     let webrtc = Arc::new(webrtc);
     let answer = webrtc.accept_offer(&offer).await?;
 
     signaler.to_tablet(&room_id, &tablet_cid, WebRtcMessage::Answer { description: answer }).await?;
     info!("cloud: sent answer");
 
-    for (c, mid) in early_cands.drain(..) {
+    // Only the peer that made the offer is part of this session.
+    for (_, c, mid) in early_cands.into_iter().filter(|(from, ..)| *from == tablet_cid) {
         if let Err(e) = webrtc.add_ice_candidate(&c, mid.as_deref(), Some(0)).await {
             warn!("cloud: bad early candidate: {e}");
         }
@@ -176,10 +180,11 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
                 ev = eventloop.poll() => match ev {
                     Ok(Event::Incoming(Packet::Publish(p))) => {
                         if let Some(SignalingEvent::Direct {
+                            client_id,
                             payload: PeerMessage::WebRtc { payload: WebRtcMessage::Candidate { candidate, mid } },
-                            ..
                         }) = SignalingEvent::from_bytes(&p.payload)
                         {
+                            if client_id != tablet_cid { continue }
                             let _ = wrtc_cands.add_ice_candidate(&candidate, mid.as_deref(), Some(0)).await;
                         }
                     }
@@ -198,4 +203,42 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
     });
 
     Ok(CloudSession { webrtc, data_rx, signaling_task })
+}
+
+/// The broker's ICE list from `room-joined`: `{"ice_servers": [...]}` whose
+/// entries carry `url` (xochitl's spelling) or `urls`, plus TURN credentials.
+fn parse_ice_servers(v: &serde_json::Value) -> Vec<IceServer> {
+    let list = v.get("ice_servers").unwrap_or(v);
+    let Some(entries) = list.as_array() else { return Vec::new() };
+    entries
+        .iter()
+        .filter_map(|e| {
+            let urls: Vec<String> = match e.get("urls").or_else(|| e.get("url"))? {
+                serde_json::Value::String(u) => vec![u.clone()],
+                serde_json::Value::Array(a) => a.iter().filter_map(|u| u.as_str().map(String::from)).collect(),
+                _ => return None,
+            };
+            let text = |k: &str| e.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+            (!urls.is_empty()).then(|| IceServer { urls, username: text("username"), credential: text("credential") })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broker_ice_servers_are_parsed() {
+        let v = serde_json::json!({"ice_servers": [
+            {"url": "stun:stun.example:3478"},
+            {"urls": ["turn:turn.example:3478"], "username": "u", "credential": "p"},
+            {"nope": true}
+        ]});
+        assert_eq!(parse_ice_servers(&v), vec![
+            IceServer::url("stun:stun.example:3478"),
+            IceServer { urls: vec!["turn:turn.example:3478".into()], username: "u".into(), credential: "p".into() },
+        ]);
+        assert!(parse_ice_servers(&serde_json::json!([])).is_empty());
+    }
 }

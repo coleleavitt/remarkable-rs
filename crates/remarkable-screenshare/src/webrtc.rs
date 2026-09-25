@@ -64,12 +64,29 @@ pub struct WebRtcHandler {
     state: Arc<RwLock<ConnectionState>>,
 }
 
+/// A STUN or TURN server.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IceServer {
+    pub urls: Vec<String>,
+    /// TURN only.
+    pub username: String,
+    /// TURN only.
+    pub credential: String,
+}
+
+impl IceServer {
+    /// A server without credentials, e.g. `stun:stun.l.google.com:19302`.
+    pub fn url(url: impl Into<String>) -> Self {
+        Self { urls: vec![url.into()], ..Self::default() }
+    }
+}
+
 /// How the local end of the peer connection is set up.
 #[derive(Debug, Clone, Default)]
 pub struct TransportConfig {
-    /// STUN/TURN server URLs. Empty means host candidates only, which is enough
+    /// STUN/TURN servers. Empty means host candidates only, which is enough
     /// when this end has a reachable address (same LAN, or a public server).
-    pub ice_servers: Vec<String>,
+    pub ice_servers: Vec<IceServer>,
     /// Restrict ICE to this UDP port range, e.g. to match a firewall rule.
     pub udp_ports: Option<(u16, u16)>,
 }
@@ -110,9 +127,10 @@ impl WebRtcHandler {
         let ice_servers: Vec<RTCIceServer> = config
             .ice_servers
             .iter()
-            .map(|url| RTCIceServer {
-                urls: vec![url.clone()],
-                ..Default::default()
+            .map(|s| RTCIceServer {
+                urls: s.urls.clone(),
+                username: s.username.clone(),
+                credential: s.credential.clone(),
             })
             .collect();
         
