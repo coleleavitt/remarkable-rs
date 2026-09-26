@@ -54,7 +54,10 @@ directories = "5"
 indicatif = { version = "0.17", features = ["tokio"] }
 tabled = "0.18"
 colored = "2"
-rumqttc = { version = "0.24", features = ["websocket"] }
+# TLS through native-tls, not rumqttc's rustls features: those depend on
+# rustls-webpki 0.102 (GHSA-82j2-j2ch-gfr8) even in 0.25.1, and their aws-lc-rs
+# provider would leave rustls unable to pick one next to webrtc's ring.
+rumqttc = { version = "0.25.1", default-features = false, features = ["websocket", "use-native-tls"] }
 
 # Test dependencies
 axum = "0.8"

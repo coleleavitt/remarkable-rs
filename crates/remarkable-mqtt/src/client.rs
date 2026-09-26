@@ -43,7 +43,8 @@
 
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, Transport};
+use rumqttc::tokio_native_tls::native_tls;
+use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -97,8 +98,7 @@ impl MqttClient {
         mqtt_options.set_keep_alive(Duration::from_secs(self.config.keep_alive_secs));
 
         // Enable TLS with native roots
-        let tls_config = rumqttc::TlsConfiguration::default();
-        mqtt_options.set_transport(Transport::Tls(tls_config));
+        mqtt_options.set_transport(tls_transport()?);
 
         // Create client and event loop
         let (client, eventloop) = AsyncClient::new(mqtt_options, 10);
@@ -273,9 +273,28 @@ pub async fn spawn_listener(
     Ok(rx)
 }
 
+/// TLS verified against the system trust store, TLS 1.2 or newer: the same
+/// floor rumqttc's rustls backend enforced before this crate moved to
+/// native-tls.
+fn tls_transport() -> Result<Transport, MqttError> {
+    let connector = native_tls::TlsConnector::builder()
+        .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+        .build()
+        .map_err(|e| MqttError::Connection(format!("TLS setup failed: {e}")))?;
+    Ok(Transport::tls_with_config(TlsConfiguration::NativeConnector(connector)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_transport_uses_native_tls() {
+        assert!(matches!(
+            tls_transport(),
+            Ok(Transport::Tls(TlsConfiguration::NativeConnector(_)))
+        ));
+    }
 
     // Integration test - requires valid tokens
     // Run with: cargo test --package remarkable-mqtt -- --ignored
