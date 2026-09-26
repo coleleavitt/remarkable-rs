@@ -26,10 +26,11 @@ thiserror.workspace = true
 bytes = "1"
 flate2 = "1.1"
 
-# WebRTC. Fork adds SettingEngine::set_sctp_max_message_size_can_receive, which
-# the tablet's >64 KiB frames need; switch back to crates.io once
-# https://github.com/webrtc-rs/webrtc/pull/908 is released.
-webrtc = { git = "https://github.com/coleleavitt/webrtc", branch = "fix/datachannel-max-message-size" }
+# WebRTC 0.17 with SettingEngine::set_sctp_max_message_size_can_receive, which
+# the tablet's >64 KiB frames need. https://github.com/webrtc-rs/webrtc/pull/908
+# is merged into upstream's v0.17.x branch (this rev) but not yet released
+# (crates.io has 0.17.2); switch to crates.io once a 0.17 release includes it.
+webrtc = { git = "https://github.com/webrtc-rs/webrtc", rev = "98d0a140d2f0a49d7ebd10feabaee18931941630" }
 
 # cloud
 remarkable-mqtt = { workspace = true, optional = true }
