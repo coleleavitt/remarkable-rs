@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use remarkable_mqtt::screenshare::{signaling_topic, subscriptions};
 use remarkable_mqtt::{PeerMessage, SignalingEvent, SignalingRequest, WebRtcMessage};
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
+use rumqttc::tokio_native_tls::native_tls;
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
@@ -56,6 +57,16 @@ pub struct CloudSession {
 
 fn sig_err(e: impl std::fmt::Display) -> Error {
     Error::MqttSignaling(e.to_string())
+}
+
+/// TLS verified against the system trust store, TLS 1.2 or newer: the same
+/// floor rumqttc's rustls backend enforced before the move to native-tls.
+fn tls_transport() -> Result<Transport> {
+    let connector = native_tls::TlsConnector::builder()
+        .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+        .build()
+        .map_err(|e| Error::MqttConnection(format!("TLS setup failed: {e}")))?;
+    Ok(Transport::tls_with_config(TlsConfiguration::NativeConnector(connector)))
 }
 
 /// Publishes signaling requests for one viewer.
@@ -91,7 +102,7 @@ pub async fn connect(cfg: CloudConfig) -> Result<CloudSession> {
     opts.set_credentials(cid.clone(), cfg.user_token.clone());
     opts.set_keep_alive(Duration::from_secs(30));
     opts.set_max_packet_size(1 << 20, 1 << 20);
-    opts.set_transport(Transport::tls_with_default_config());
+    opts.set_transport(tls_transport()?);
 
     info!("cloud: connecting to {}:{} as {}", cfg.host, cfg.port, cid);
     let (client, mut eventloop) = AsyncClient::new(opts, 64);
